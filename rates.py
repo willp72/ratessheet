@@ -35,6 +35,8 @@ BUCKETS = [
     ("isa_24m", "24m ISA"),
 ]
 
+HEALTH: dict[str, object] = {}
+
 UA = (
     "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
     "(KHTML, like Gecko) Chrome/148.0.0.0 Safari/537.36"
@@ -128,46 +130,84 @@ def parse_hl(html: str, isa: bool) -> list[Product]:
 # ---------------------------------------------------------------------------
 
 METEOR = {
-    ("easy-access", False): "https://savings.meteoram.com/savings/easy-access?filter0=general",
-    ("fixed-term", False): "https://savings.meteoram.com/savings/fixed-term?filter0=general",
-    ("easy-access", True): "https://savings.meteoram.com/savings/easy-access?filter0=cash-isa",
-    ("fixed-term", True): "https://savings.meteoram.com/savings/fixed-term?filter0=cash-isa",
+    "easy-access": "https://savings.meteoram.com/savings/easy-access?filter0=general",
+    "fixed-term": "https://savings.meteoram.com/savings/fixed-term?filter0=general",
 }
 
 
-def parse_meteor(html: str, isa: bool, page_kind: str) -> list[Product]:
-    """Rates sit in <p class="rateInfoValue">; bank name is the nearest heading."""
+def _meteor_card(node):
+    """Walk up from a rate node to the product card (the bit with the bank name)."""
+    card = node
+    for _ in range(10):
+        card = card.parent
+        if card is None:
+            return None
+        if card.find(["h2", "h3", "h4"]):
+            return card
+    return None
+
+
+def parse_meteor(html: str) -> list[Product]:
+    """
+    Every Meteor card states its own Type and Term, and carries tick/cross icons
+    for General and Cash ISA eligibility. Trust the card, never the page: the
+    easy access page carries promoted fixed term cards, and the ?filter0= query
+    param is applied client-side so a plain fetch ignores it.
+    """
     soup = BeautifulSoup(html, "lxml")
     out = []
+
     for node in soup.select(".rateInfoValue"):
         rate = parse_rate(re.sub(r"\s+", " ", node.get_text(" ")))
         if not rate:
             continue
-
-        # Walk up to the product card, then find the bank name and term label.
-        card = node
-        for _ in range(8):
-            card = card.parent
-            if card is None:
-                break
-            if card.find(["h2", "h3", "h4"]):
-                break
+        card = _meteor_card(node)
         if card is None:
             continue
 
-        heading = card.find(["h2", "h3", "h4"])
-        bank = heading.get_text(" ", strip=True) if heading else "unknown"
+        bank = card.find(["h2", "h3", "h4"]).get_text(" ", strip=True)
+        text = re.sub(r"\s+", " ", card.get_text(" "))
 
-        card_text = re.sub(r"\s+", " ", card.get_text(" "))
-        if page_kind == "easy-access":
+        m_type = re.search(r"Type\s+(Easy Access|Fixed Term|Notice)", text)
+        if not m_type:
+            continue
+        kind = m_type.group(1)
+        if kind == "Notice":
+            continue
+
+        if kind == "Easy Access":
             term_raw = "Easy Access"
         else:
-            m = re.search(r"(\d+(?:\.\d+)?\s*(?:month|months|year|years))", card_text, re.I)
-            term_raw = m.group(1) if m else ""
+            m_term = re.search(
+                r"Term\s+(\d+(?:\.\d+)?\s*(?:month|months|year|years))", text
+            )
+            if not m_term:
+                continue
+            term_raw = m_term.group(1)
 
-        bucket = normalise_term(term_raw, isa)
-        if bucket:
-            out.append(Product("Meteor", bank, rate, term_raw, bucket, isa))
+        # Eligibility. Standard cards show both labels with a tick or a cross.
+        # Promoted cards show a single label and no icons at all.
+        general = isa = False
+        icons = card.select("[data-name]")
+        if icons:
+            for icon in icons:
+                label = icon.parent.get_text(" ", strip=True)
+                if not label and icon.parent.parent:
+                    label = icon.parent.parent.get_text(" ", strip=True)
+                ok = icon.get("data-name") == "yes_tick"
+                if "Cash ISA" in label:
+                    isa = isa or ok
+                elif "General" in label:
+                    general = general or ok
+        else:
+            isa = "Cash ISA" in text
+            general = "General" in text
+
+        for is_isa in (v for v, on in ((False, general), (True, isa)) if on):
+            bucket = normalise_term(term_raw, is_isa)
+            if bucket:
+                out.append(Product("Meteor", bank, rate, term_raw, bucket, is_isa))
+
     return out
 
 
@@ -312,19 +352,18 @@ def collect() -> list[Product]:
         try:
             got = fn()
             print(f"  {label}: {len(got)} products", file=sys.stderr)
+            HEALTH[label] = len(got)
             products.extend(got)
         except Exception as e:
             print(f"  {label}: FAILED {type(e).__name__}: {e}", file=sys.stderr)
+            HEALTH[label] = f"FAILED: {type(e).__name__}"
 
     print("Collecting...", file=sys.stderr)
     attempt("HL general", lambda: parse_hl(fetch_rendered(HL_GENERAL, hl_prep), False))
     attempt("HL ISA", lambda: parse_hl(fetch_rendered(HL_ISA, hl_prep), True))
 
-    for (kind, isa), url in METEOR.items():
-        attempt(
-            f"Meteor {kind} {'ISA' if isa else ''}".strip(),
-            lambda u=url, i=isa, k=kind: parse_meteor(fetch_plain(u), i, k),
-        )
+    for kind, url in METEOR.items():
+        attempt(f"Meteor {kind}", lambda u=url: parse_meteor(fetch_plain(u)))
 
     attempt("Raisin easy", lambda: parse_raisin(fetch_rendered(RAISIN_EASY, raisin_prep), "easy"))
     attempt("Raisin fixed", lambda: parse_raisin(fetch_rendered(RAISIN_FIXED, raisin_prep), "fixed"))
@@ -334,10 +373,22 @@ def collect() -> list[Product]:
 
 
 def top_ten(products: list[Product]) -> dict[str, list[Product]]:
-    """Rank within each bucket. Duplicates across sources are kept, as requested."""
+    """
+    Rank within each bucket. Duplicates across platforms are kept, as requested,
+    but the exact same listing scraped twice from one platform is not a duplicate,
+    it's a double count. Those are dropped.
+    """
     out = {}
     for key, _ in BUCKETS:
-        rows = [p for p in products if p.bucket == key]
+        rows, seen = [], set()
+        for p in products:
+            if p.bucket != key:
+                continue
+            sig = (p.source, p.bank.lower().strip(), p.rate, p.term_raw.lower())
+            if sig in seen:
+                continue
+            seen.add(sig)
+            rows.append(p)
         rows.sort(key=lambda p: -p.rate)
         out[key] = rows[:10]
     return out
@@ -382,6 +433,10 @@ def write_sheet(ranked: dict[str, list[Product]], products: list[Product]):
         for i in range(10):
             rows.append([i + 1, f"{got[i].rate:.2f}" if i < len(got) else ""])
         rows.append([])
+
+    rows.append(["Source health"])
+    for label, count in HEALTH.items():
+        rows.append([label, count])
 
     report = sh.worksheet("Report") if "Report" in [w.title for w in sh.worksheets()] \
         else sh.add_worksheet("Report", rows=200, cols=6)
