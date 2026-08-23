@@ -35,6 +35,8 @@ BUCKETS = [
     ("isa_24m", "24m ISA"),
 ]
 
+SOURCES = ["HL", "Meteor", "Flagstone", "Raisin"]
+
 HEALTH: dict[str, object] = {}
 
 UA = (
@@ -518,7 +520,7 @@ def collect() -> list[Product]:
     return products
 
 
-def top_ten(products: list[Product]) -> dict[str, list[Product]]:
+def top_ten(products: list[Product], source: str | None = None) -> dict[str, list[Product]]:
     """
     Rank within each bucket. Duplicates across platforms are kept, as requested,
     but the exact same listing scraped twice from one platform is not a duplicate,
@@ -530,6 +532,8 @@ def top_ten(products: list[Product]) -> dict[str, list[Product]]:
         for p in products:
             if p.bucket != key:
                 continue
+            if source and p.source != source:
+                continue
             sig = (p.source, p.bank.lower().strip(), p.rate, p.term_raw.lower())
             if sig in seen:
                 continue
@@ -538,6 +542,18 @@ def top_ten(products: list[Product]) -> dict[str, list[Product]]:
         rows.sort(key=lambda p: -p.rate)
         out[key] = rows[:10]
     return out
+
+
+def report_rows(ranked: dict[str, list[Product]], title: str) -> list[list]:
+    """The ten tables, rates only, in Anna's order. Used by sheet and xlsx."""
+    rows = [[title], []]
+    for key, label in BUCKETS:
+        rows.append([label])
+        got = ranked[key]
+        for i in range(10):
+            rows.append([i + 1, f"{got[i].rate:.2f}" if i < len(got) else ""])
+        rows.append([])
+    return rows
 
 
 def render_text(ranked: dict[str, list[Product]]) -> str:
@@ -572,22 +588,30 @@ def write_sheet(ranked: dict[str, list[Product]], products: list[Product]):
 
     today = date.today().isoformat()
 
-    rows = [[f"Savings rates, {today}, £{AMOUNT:,} deposit"], []]
-    for key, label in BUCKETS:
-        rows.append([label])
-        got = ranked[key]
-        for i in range(10):
-            rows.append([i + 1, f"{got[i].rate:.2f}" if i < len(got) else ""])
-        rows.append([])
+    def tab(title, rows_needed=200):
+        existing = [w.title for w in sh.worksheets()]
+        return (sh.worksheet(title) if title in existing
+                else sh.add_worksheet(title, rows=rows_needed, cols=6))
 
+    # Pooled report across all four platforms.
+    rows = report_rows(ranked, f"All platforms, {today}, \u00a3{AMOUNT:,} deposit")
     rows.append(["Source health"])
     for label, count in HEALTH.items():
         rows.append([label, count])
 
-    report = sh.worksheet("Report") if "Report" in [w.title for w in sh.worksheets()] \
-        else sh.add_worksheet("Report", rows=200, cols=6)
+    report = tab("Report")
     report.clear()
     report.update(values=rows, range_name="A1")
+
+    # One tab per platform, same ten tables, that platform only.
+    for name in SOURCES:
+        per = top_ten(products, source=name)
+        ws = tab(name)
+        ws.clear()
+        ws.update(
+            values=report_rows(per, f"{name} only, {today}, \u00a3{AMOUNT:,} deposit"),
+            range_name="A1",
+        )
 
     detail_rows = [["date", "bucket", "rate", "bank", "source", "term_raw"]]
     for key, label in BUCKETS:
@@ -601,9 +625,132 @@ def write_sheet(ranked: dict[str, list[Product]], products: list[Product]):
     print(f"Wrote {len(products)} products to sheet", file=sys.stderr)
 
 
+# ---------------------------------------------------------------------------
+# Email
+# ---------------------------------------------------------------------------
+
+def build_xlsx(ranked, products, path: str):
+    """Two sheets: the report as Anna wants it, and the full audit trail."""
+    from datetime import date
+    from openpyxl import Workbook
+    from openpyxl.styles import Font
+
+    wb = Workbook()
+    bold = Font(name="Arial", bold=True)
+    plain = Font(name="Arial")
+
+    def write_block(ws, ranked_set, title):
+        for row in report_rows(ranked_set, title):
+            ws.append(row if row else [None])
+        ws.column_dimensions["A"].width = 28
+        ws.column_dimensions["B"].width = 12
+        ws["A1"].font = bold
+
+    ws = wb.active
+    ws.title = "Report"
+    write_block(ws, ranked, f"All platforms, {date.today():%d %B %Y}, \u00a3{AMOUNT:,} deposit")
+    ws.append(["Source health"])
+    ws.cell(ws.max_row, 1).font = bold
+    for label, count in HEALTH.items():
+        ws.append([label, count])
+
+    for name in SOURCES:
+        per = wb.create_sheet(name)
+        write_block(
+            per,
+            top_ten(products, source=name),
+            f"{name} only, {date.today():%d %B %Y}, \u00a3{AMOUNT:,} deposit",
+        )
+
+    det = wb.create_sheet("Detail")
+    det.append(["bucket", "rank", "rate", "bank", "source", "term as listed"])
+    for c in det[1]:
+        c.font = bold
+    for key, label in BUCKETS:
+        for i, p in enumerate(ranked[key], 1):
+            det.append([label, i, float(p.rate), p.bank, p.source, p.term_raw])
+    for col, w in zip("ABCDEF", (18, 6, 8, 38, 12, 20)):
+        det.column_dimensions[col].width = w
+    det.freeze_panes = "A2"
+
+    labels = {label for _, label in BUCKETS} | {"Source health"}
+    for sheet in wb.worksheets:
+        for row in sheet.iter_rows():
+            for c in row:
+                if c.row > 1 and c.column == 1 and c.value in labels:
+                    c.font = bold
+                elif c.font is not bold:
+                    c.font = plain
+
+    wb.save(path)
+
+
+def send_email(ranked, products):
+    """
+    Send from Gmail over SMTP. Authenticating as a real Gmail account means the
+    mail leaves Google's servers with valid SPF and DKIM, rather than
+    originating from a GitHub runner IP, which matters for getting into a
+    bank's inbox rather than its quarantine.
+    """
+    import smtplib
+    import ssl
+    from datetime import date
+    from email.message import EmailMessage
+
+    user = os.environ.get("GMAIL_USER")
+    password = os.environ.get("GMAIL_APP_PASSWORD")
+    recipients = [a.strip() for a in os.environ.get("REPORT_TO", "").split(",") if a.strip()]
+
+    if not (user and password and recipients):
+        print("Email not configured, skipping", file=sys.stderr)
+        return
+
+    thin = [label for key, label in BUCKETS if len(ranked[key]) < 10]
+    failed = [k for k, v in HEALTH.items() if isinstance(v, str) or v == 0]
+
+    body = [
+        f"Savings rates for {date.today():%d %B %Y}, £{AMOUNT:,} deposit.",
+        "",
+        render_text(ranked).rstrip(),
+        "",
+    ]
+    if thin:
+        body.append(f"Fewer than 10 products available: {', '.join(thin)}.")
+    if failed:
+        body.append(f"Sources that returned nothing: {', '.join(failed)}.")
+        body.append("Those tables are drawn from the remaining sources only.")
+    body += [
+        "",
+        f"{len(products)} products collected. Full detail in the attached file.",
+        "Rates are AER. Compiled automatically, worth spot checking before use.",
+    ]
+
+    msg = EmailMessage()
+    msg["Subject"] = f"Savings rates, {date.today():%d %b %Y}"
+    msg["From"] = user
+    msg["To"] = ", ".join(recipients)
+    msg.set_content("\n".join(body))
+
+    path = f"savings-rates-{date.today():%Y-%m-%d}.xlsx"
+    build_xlsx(ranked, products, path)
+    with open(path, "rb") as fh:
+        msg.add_attachment(
+            fh.read(),
+            maintype="application",
+            subtype="vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+            filename=path,
+        )
+
+    with smtplib.SMTP_SSL("smtp.gmail.com", 465, context=ssl.create_default_context()) as s:
+        s.login(user, password)
+        s.send_message(msg)
+
+    print(f"Emailed {len(recipients)} recipient(s)", file=sys.stderr)
+
+
 def main():
     ap = argparse.ArgumentParser()
-    ap.add_argument("--local", action="store_true", help="print only, no sheet write")
+    ap.add_argument("--local", action="store_true", help="print only, no sheet write, no email")
     args = ap.parse_args()
 
     products = collect()
@@ -619,6 +766,7 @@ def main():
 
     if not args.local:
         write_sheet(ranked, products)
+        send_email(ranked, products)
 
 
 if __name__ == "__main__":
