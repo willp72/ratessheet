@@ -1,0 +1,31 @@
+name: Keepalive
+
+# GitHub disables scheduled workflows after 60 days with no repository
+# activity, and only commits reset that timer. This repo otherwise never
+# changes, so the rates schedule would stop silently around day 60.
+#
+# Runs monthly, comfortably inside the 60 day window, and touches only
+# .keepalive so nothing here can affect rates.py or its workflow.
+
+on:
+  schedule:
+    - cron: "0 4 5 * *"     # 04:00 UTC on the 5th of each month
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  touch:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Commit a dated marker
+        run: |
+          date -u +"last keepalive: %Y-%m-%d %H:%M UTC" > .keepalive
+          git config user.name  "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add .keepalive
+          git commit -m "chore: keepalive" || exit 0
+          git push
