@@ -2,13 +2,19 @@ name: Savings rates
 
 on:
   schedule:
-    - cron: "30 6 * * 1-5"
-  workflow_dispatch:
+    # 08:12 London, every day. The timezone field tracks BST and GMT, so no
+    # drift in October. :12 rather than :00 because every cron on the platform
+    # fires on the hour and scheduled runs are best-effort, so an offset minute
+    # tends to get picked up sooner.
+    - cron: "12 8 * * *"
+      timezone: Europe/London
+  workflow_dispatch:          # manual "Run workflow" button
 
 jobs:
   collect:
     runs-on: ubuntu-latest
-    timeout-minutes: 15
+    timeout-minutes: 20       # Raisin's Load more paging makes runs longer
+
     steps:
       - uses: actions/checkout@v4
 
@@ -25,4 +31,7 @@ jobs:
         env:
           GOOGLE_CREDENTIALS: ${{ secrets.GOOGLE_CREDENTIALS }}
           SHEET_ID: ${{ secrets.SHEET_ID }}
+          GMAIL_USER: ${{ secrets.GMAIL_USER }}
+          GMAIL_APP_PASSWORD: ${{ secrets.GMAIL_APP_PASSWORD }}
+          REPORT_TO: ${{ secrets.REPORT_TO }}
         run: python rates.py
