@@ -2,14 +2,19 @@ name: Savings rates
 
 on:
   schedule:
-    # 06:30 UTC weekdays. GitHub runs on UTC, so this is 07:30 BST.
-    - cron: "30 6 * * 1-5"
-  workflow_dispatch:        # gives you a "Run workflow" button for manual runs
+    # 08:12 London, every day. The timezone field tracks BST and GMT, so no
+    # drift in October. :12 rather than :00 because every cron on the platform
+    # fires on the hour and scheduled runs are best-effort, so an offset minute
+    # tends to get picked up sooner.
+    - cron: "12 8 * * *"
+      timezone: Europe/London
+  workflow_dispatch:          # manual "Run workflow" button
 
 jobs:
   collect:
     runs-on: ubuntu-latest
-    timeout-minutes: 15
+    timeout-minutes: 20       # Raisin's Load more paging makes runs longer
+
     steps:
       - uses: actions/checkout@v4
 
