@@ -215,6 +215,9 @@ def parse_meteor(html: str) -> list[Product]:
 # Source: Raisin  (needs a browser; sort by term to force all rows to render)
 # ---------------------------------------------------------------------------
 
+RAISIN_READY = '[class*="styles-module_rate__"]'
+HL_READY = "table tbody tr"
+
 RAISIN_EASY = "https://www.raisin.com/en-gb/savings-accounts/easy-access-savings-accounts/"
 RAISIN_FIXED = "https://www.raisin.com/en-gb/savings-accounts/fixed-rate-bonds/"
 
@@ -285,20 +288,41 @@ def fetch_plain(url: str) -> str:
     return r.text
 
 
-def fetch_rendered(url: str, prep=None) -> str:
-    """Load with a real browser. prep(page) runs before the HTML is grabbed."""
+def fetch_rendered(url: str, ready: str, prep=None) -> str:
+    """
+    Load with a real browser and wait for `ready` to appear.
+
+    Never wait for networkidle on these sites. They run Datadog RUM, Exponea,
+    Clarity and Optimizely, which beacon on a timer, so the network never goes
+    quiet and the wait burns the full timeout on a page that loaded in seconds.
+    Wait for the content instead.
+    """
     from playwright.sync_api import sync_playwright
 
     with sync_playwright() as p:
         browser = p.chromium.launch()
         page = browser.new_page(user_agent=UA, viewport={"width": 1400, "height": 1200})
-        page.goto(url, wait_until="networkidle", timeout=60000)
+        page.goto(url, wait_until="domcontentloaded", timeout=45000)
         dismiss_cookies(page)
+        page.wait_for_selector(ready, timeout=30000)
         if prep:
             prep(page)
         html = page.content()
         browser.close()
     return html
+
+
+def scroll_until_stable(page, selector: str, limit: int = 25) -> int:
+    """Scroll until the number of matching elements stops growing."""
+    last = -1
+    for _ in range(limit):
+        count = page.locator(selector).count()
+        if count == last:
+            break
+        last = count
+        page.mouse.wheel(0, 5000)
+        page.wait_for_timeout(700)
+    return last
 
 
 def dismiss_cookies(page):
@@ -317,28 +341,34 @@ def dismiss_cookies(page):
 
 
 def raisin_prep(page):
-    """Set the amount, then sort by term so every row renders."""
-    try:
-        box = page.locator("input[value*='50'], input[name*='amount']").first
-        box.fill(str(AMOUNT))
-        page.keyboard.press("Enter")
-        page.wait_for_timeout(1500)
-    except Exception:
-        pass
-    try:
-        page.click("text=Term", timeout=4000)
-        page.wait_for_timeout(2000)
-    except Exception:
-        pass
-    for _ in range(12):
-        page.mouse.wheel(0, 4000)
-        page.wait_for_timeout(400)
+    """Set the amount, sort by term, then scroll until every row has rendered."""
+    for sel in ("input[inputmode='numeric']", "input[type='text']"):
+        try:
+            box = page.locator(sel).first
+            box.click(timeout=3000)
+            box.fill(str(AMOUNT))
+            page.keyboard.press("Enter")
+            page.wait_for_timeout(2000)
+            break
+        except Exception:
+            continue
+
+    # Sorting by term forces the long-dated rows into the DOM.
+    for sel in ("th:has-text('Term')", "[role='button']:has-text('Term')", "text=Term"):
+        try:
+            page.locator(sel).first.click(timeout=4000)
+            page.wait_for_timeout(2500)
+            break
+        except Exception:
+            continue
+
+    got = scroll_until_stable(page, RAISIN_READY)
+    print(f"    raisin rows after scroll: {got}", file=sys.stderr)
 
 
 def hl_prep(page):
-    for _ in range(10):
-        page.mouse.wheel(0, 4000)
-        page.wait_for_timeout(300)
+    got = scroll_until_stable(page, HL_READY)
+    print(f"    hl rows after scroll: {got}", file=sys.stderr)
 
 
 # ---------------------------------------------------------------------------
@@ -359,14 +389,14 @@ def collect() -> list[Product]:
             HEALTH[label] = f"FAILED: {type(e).__name__}"
 
     print("Collecting...", file=sys.stderr)
-    attempt("HL general", lambda: parse_hl(fetch_rendered(HL_GENERAL, hl_prep), False))
-    attempt("HL ISA", lambda: parse_hl(fetch_rendered(HL_ISA, hl_prep), True))
+    attempt("HL general", lambda: parse_hl(fetch_rendered(HL_GENERAL, HL_READY, hl_prep), False))
+    attempt("HL ISA", lambda: parse_hl(fetch_rendered(HL_ISA, HL_READY, hl_prep), True))
 
     for kind, url in METEOR.items():
         attempt(f"Meteor {kind}", lambda u=url: parse_meteor(fetch_plain(u)))
 
-    attempt("Raisin easy", lambda: parse_raisin(fetch_rendered(RAISIN_EASY, raisin_prep), "easy"))
-    attempt("Raisin fixed", lambda: parse_raisin(fetch_rendered(RAISIN_FIXED, raisin_prep), "fixed"))
+    attempt("Raisin easy", lambda: parse_raisin(fetch_rendered(RAISIN_EASY, RAISIN_READY, raisin_prep), "easy"))
+    attempt("Raisin fixed", lambda: parse_raisin(fetch_rendered(RAISIN_FIXED, RAISIN_READY, raisin_prep), "fixed"))
     attempt("Flagstone ISA", lambda: parse_flagstone_isa(fetch_plain(FLAGSTONE_ISA)))
 
     return products
