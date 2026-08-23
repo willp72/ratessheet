@@ -129,9 +129,15 @@ def parse_hl(html: str, isa: bool) -> list[Product]:
 # Source: Meteor  (server rendered, plain fetch is enough)
 # ---------------------------------------------------------------------------
 
+# All four URLs from the brief. The filter0 param is applied client-side, so
+# these very likely return identical HTML, but fetching all four costs two
+# extra plain requests and removes any doubt about ISA-only products being
+# absent from the general pages. Dedupe in top_ten() handles the overlap.
 METEOR = {
-    "easy-access": "https://savings.meteoram.com/savings/easy-access?filter0=general",
-    "fixed-term": "https://savings.meteoram.com/savings/fixed-term?filter0=general",
+    "easy-access general": "https://savings.meteoram.com/savings/easy-access?filter0=general",
+    "fixed-term general": "https://savings.meteoram.com/savings/fixed-term?filter0=general",
+    "easy-access isa": "https://savings.meteoram.com/savings/easy-access?filter0=cash-isa",
+    "fixed-term isa": "https://savings.meteoram.com/savings/fixed-term?filter0=cash-isa",
 }
 
 
@@ -145,6 +151,30 @@ def _meteor_card(node):
         if card.find(["h2", "h3", "h4"]):
             return card
     return None
+
+
+def meteor_pages(url: str) -> list[str]:
+    """
+    Fetch every page of a Meteor listing.
+
+    Meteor paginates server-side with &page=N and links each page in a
+    .pagination block, so page 1 alone gives about 10 products. The filter0
+    param is also server-side, which is why all four brief URLs are fetched.
+    """
+    first = fetch_plain(url)
+    soup = BeautifulSoup(first, "lxml")
+
+    pages = {1}
+    for a in soup.select(".pagination a[href]"):
+        m = re.search(r"[?&]page=(\d+)", a["href"])
+        if m:
+            pages.add(int(m.group(1)))
+
+    out = [first]
+    for n in sorted(pages)[1:]:
+        sep = "&" if "?" in url else "?"
+        out.append(fetch_plain(f"{url}{sep}page={n}"))
+    return out
 
 
 def parse_meteor(html: str) -> list[Product]:
@@ -254,10 +284,54 @@ def parse_raisin(html: str, page_kind: str) -> list[Product]:
 # Source: Flagstone ISA page  (schema.org JSON in the HTML, plain fetch)
 # ---------------------------------------------------------------------------
 
-FLAGSTONE_ISA = "https://www.flagstoneim.com/personal/cash-isa"
+FLAGSTONE_SAMPLE = "https://clients.direct.flagstoneim.com/build-your-sample-portfolio?accounttype=individual"
+FLAGSTONE_SAMPLE_READY = "article"
 
 
-def parse_flagstone_isa(html: str) -> list[Product]:
+def parse_flagstone_sample(html: str) -> list[Product]:
+    """
+    The sample portfolio builder renders one <article> per product:
+    "Chetwood Bank Best Flagstone 12 month fixed term 4.83% | 4.83%
+     Rate (AER | Gross) Fixed 12 months Term ..."
+    The first percentage is AER, the second is Gross. Take the first.
+    """
+    soup = BeautifulSoup(html, "lxml")
+    out = []
+    for art in soup.find_all("article"):
+        text = re.sub(r"\s+", " ", art.get_text(" ", strip=True))
+
+        rates = re.findall(r"(\d+\.\d+)%", text)
+        if not rates:
+            continue
+        rate = float(rates[0])
+
+        m = re.search(
+            r"(Fixed\s+\d+\s+(?:month|months|year|years)|Instant Access)", text, re.I
+        )
+        if not m:
+            continue
+        term_raw = m.group(1)
+
+        # Bank name is the leading text, before the first percentage or badge.
+        bank = re.split(r"\s*(?:Best Flagstone|\d+\.\d+%)", text)[0].strip()
+
+        bucket = normalise_term(term_raw, isa=False)
+        if bucket:
+            out.append(Product("Flagstone", bank or "unknown", rate, term_raw, bucket, False))
+    return out
+
+
+FLAGSTONE = {
+    # Public marketing pages, same Umbraco template, same schema.org blocks.
+    # The client sample-portfolio tool is deliberately excluded: it needs a
+    # login and it is Flagstone's client area.
+    "instant access": ("https://www.flagstoneim.com/personal/savings-accounts/instant-access", False),
+    "fixed rates": ("https://www.flagstoneim.com/personal/savings-accounts/fixed-rates", False),
+    "cash ISA": ("https://www.flagstoneim.com/personal/cash-isa", True),
+}
+
+
+def parse_flagstone(html: str, isa: bool) -> list[Product]:
     out = []
     for blob in re.findall(
         r'<script type="application/ld\+json">(\{.*?)</script>', html, re.S
@@ -272,9 +346,9 @@ def parse_flagstone_isa(html: str) -> list[Product]:
         name = d.get("name", "")
         brand = d.get("brand", name)
         term_raw = name.replace(brand, "").strip()
-        bucket = normalise_term(term_raw, isa=True)
+        bucket = normalise_term(term_raw, isa)
         if rate and bucket:
-            out.append(Product("Flagstone", brand, rate, term_raw, bucket, True))
+            out.append(Product("Flagstone", brand, rate, term_raw, bucket, isa))
     return out
 
 
@@ -315,14 +389,39 @@ def fetch_rendered(url: str, ready: str, prep=None) -> str:
 def scroll_until_stable(page, selector: str, limit: int = 25) -> int:
     """Scroll until the number of matching elements stops growing."""
     last = -1
+    stalls = 0
     for _ in range(limit):
         count = page.locator(selector).count()
         if count == last:
-            break
+            stalls += 1
+            if stalls >= 2:      # two stalls, not one: lazy loads need a beat
+                break
+        else:
+            stalls = 0
         last = count
         page.mouse.wheel(0, 5000)
-        page.wait_for_timeout(700)
+        page.wait_for_timeout(900)
     return last
+
+
+def click_load_more(page, button, selector: str, limit: int = 30) -> int:
+    """
+    Click a 'Load more' button until it disappears.
+
+    Raisin paginates behind a button rather than on scroll, so no amount of
+    wheeling will reveal rows 11 onwards.
+    """
+    for i in range(limit):
+        btn = page.locator(button)
+        try:
+            if btn.count() == 0 or not btn.first.is_visible():
+                break
+            btn.first.scroll_into_view_if_needed(timeout=5000)
+            btn.first.click(timeout=5000)
+            page.wait_for_timeout(1200)
+        except Exception:
+            break
+    return page.locator(selector).count()
 
 
 def dismiss_cookies(page):
@@ -340,8 +439,17 @@ def dismiss_cookies(page):
             continue
 
 
+RAISIN_LOAD_MORE = '[class*="styles-module_loadMore"] button, button:has-text("Load more")'
+
+
 def raisin_prep(page):
-    """Set the amount, sort by term, then scroll until every row has rendered."""
+    """
+    Set the amount, then exhaust the Load more button.
+
+    Raisin shows 10 products and hides the rest behind Load more. Sorting only
+    reorders those 10, which is why an earlier run returned five year bonds and
+    nothing else. No sort is needed once every row is loaded, we rank ourselves.
+    """
     for sel in ("input[inputmode='numeric']", "input[type='text']"):
         try:
             box = page.locator(sel).first
@@ -353,17 +461,10 @@ def raisin_prep(page):
         except Exception:
             continue
 
-    # Sorting by term forces the long-dated rows into the DOM.
-    for sel in ("th:has-text('Term')", "[role='button']:has-text('Term')", "text=Term"):
-        try:
-            page.locator(sel).first.click(timeout=4000)
-            page.wait_for_timeout(2500)
-            break
-        except Exception:
-            continue
-
-    got = scroll_until_stable(page, RAISIN_READY)
-    print(f"    raisin rows after scroll: {got}", file=sys.stderr)
+    got = click_load_more(page, RAISIN_LOAD_MORE, RAISIN_READY)
+    print(f"    raisin rows loaded: {got}", file=sys.stderr)
+    if got <= 10:
+        print("    WARNING: Load more did not fire, only page 1 captured", file=sys.stderr)
 
 
 def hl_prep(page):
@@ -393,11 +494,26 @@ def collect() -> list[Product]:
     attempt("HL ISA", lambda: parse_hl(fetch_rendered(HL_ISA, HL_READY, hl_prep), True))
 
     for kind, url in METEOR.items():
-        attempt(f"Meteor {kind}", lambda u=url: parse_meteor(fetch_plain(u)))
+        attempt(
+            f"Meteor {kind}",
+            lambda u=url: [p for h in meteor_pages(u) for p in parse_meteor(h)],
+        )
+
+    attempt(
+        "Flagstone sample portfolio",
+        lambda: parse_flagstone_sample(
+            fetch_rendered(FLAGSTONE_SAMPLE, FLAGSTONE_SAMPLE_READY)
+        ),
+    )
+
+    for kind, (url, isa) in FLAGSTONE.items():
+        attempt(
+            f"Flagstone {kind}",
+            lambda u=url, i=isa: parse_flagstone(fetch_plain(u), i),
+        )
 
     attempt("Raisin easy", lambda: parse_raisin(fetch_rendered(RAISIN_EASY, RAISIN_READY, raisin_prep), "easy"))
     attempt("Raisin fixed", lambda: parse_raisin(fetch_rendered(RAISIN_FIXED, RAISIN_READY, raisin_prep), "fixed"))
-    attempt("Flagstone ISA", lambda: parse_flagstone_isa(fetch_plain(FLAGSTONE_ISA)))
 
     return products
 
