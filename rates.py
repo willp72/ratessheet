@@ -19,7 +19,9 @@ import requests
 from bs4 import BeautifulSoup
 
 # Amount held constant so week-on-week comparisons are like for like.
-AMOUNT = 50000
+# Products whose published minimum exceeds this are excluded: a rate a
+# £1,000 saver cannot actually open is not a rate.
+AMOUNT = 1000
 
 # Anna's report order. Keys are internal, values are the labels in the output.
 BUCKETS = [
@@ -53,6 +55,7 @@ class Product:
     term_raw: str
     bucket: str
     isa: bool
+    min_deposit: float | None = None    # None means the source does not publish one
 
 
 # ---------------------------------------------------------------------------
@@ -86,6 +89,11 @@ def normalise_term(raw: str, isa: bool) -> str | None:
     return {6: "6m", 9: "9m", 12: "12m", 24: "24m", 36: "36m", 60: "60m"}.get(months)
 
 
+def parse_money(txt: str) -> float | None:
+    m = re.search(r"£\s*([\d,]+(?:\.\d+)?)", txt)
+    return float(m.group(1).replace(",", "")) if m else None
+
+
 def parse_rate(txt: str) -> float | None:
     m = re.search(r"(\d+\.\d+)\s*%", txt)
     return float(m.group(1)) if m else None
@@ -112,6 +120,7 @@ def parse_hl(html: str, isa: bool) -> list[Product]:
             i_term = next(i for i, h in enumerate(heads) if h == "term")
         except StopIteration:
             continue
+        i_min = next((i for i, h in enumerate(heads) if "min opening" in h), None)
 
         for tr in table.select("tbody tr"):
             tds = tr.find_all("td")
@@ -122,8 +131,10 @@ def parse_hl(html: str, isa: bool) -> list[Product]:
             rate = parse_rate(tds[i_aer].get_text())
             term_raw = tds[i_term].get_text(" ", strip=True)
             bucket = normalise_term(term_raw, isa)
+            min_dep = (parse_money(tds[i_min].get_text())
+                       if i_min is not None and len(tds) > i_min else None)
             if rate and bucket:
-                out.append(Product("HL", bank, rate, term_raw, bucket, isa))
+                out.append(Product("HL", bank, rate, term_raw, bucket, isa, min_dep))
     return out
 
 
@@ -235,10 +246,13 @@ def parse_meteor(html: str) -> list[Product]:
             isa = "Cash ISA" in text
             general = "General" in text
 
+        m_dep = re.search(r"Deposit amount\s*(£[\d,]+)", text)
+        min_dep = parse_money(m_dep.group(1)) if m_dep else None
+
         for is_isa in (v for v, on in ((False, general), (True, isa)) if on):
             bucket = normalise_term(term_raw, is_isa)
             if bucket:
-                out.append(Product("Meteor", bank, rate, term_raw, bucket, is_isa))
+                out.append(Product("Meteor", bank, rate, term_raw, bucket, is_isa, min_dep))
 
     return out
 
@@ -288,6 +302,14 @@ def parse_raisin(html: str, page_kind: str) -> list[Product]:
 
 FLAGSTONE_SAMPLE = "https://clients.direct.flagstoneim.com/build-your-sample-portfolio?accounttype=individual"
 FLAGSTONE_SAMPLE_READY = "article"
+FLAGSTONE_SHOW_MORE = 'button:has-text("Show more")'
+
+
+def flagstone_prep(page):
+    """Exhaust Show more so every product is in the DOM, then filter by
+    minimum deposit ourselves. More reliable than driving the sort control."""
+    got = click_load_more(page, FLAGSTONE_SHOW_MORE, FLAGSTONE_SAMPLE_READY)
+    print(f"    flagstone articles loaded: {got}", file=sys.stderr)
 
 
 def parse_flagstone_sample(html: str) -> list[Product]:
@@ -317,9 +339,13 @@ def parse_flagstone_sample(html: str) -> list[Product]:
         # Bank name is the leading text, before the first percentage or badge.
         bank = re.split(r"\s*(?:Best Flagstone|\d+\.\d+%)", text)[0].strip()
 
+        m_dep = re.search(r"(£[\d,]+)\s*[-\u2013]\s*£[\d,]+\s*Min\s*-\s*Max", text)
+        min_dep = parse_money(m_dep.group(1)) if m_dep else None
+
         bucket = normalise_term(term_raw, isa=False)
         if bucket:
-            out.append(Product("Flagstone", bank or "unknown", rate, term_raw, bucket, False))
+            out.append(Product("Flagstone", bank or "unknown", rate, term_raw,
+                               bucket, False, min_dep))
     return out
 
 
@@ -327,8 +353,9 @@ FLAGSTONE = {
     # Public marketing pages, same Umbraco template, same schema.org blocks.
     # The client sample-portfolio tool is deliberately excluded: it needs a
     # login and it is Flagstone's client area.
-    "instant access": ("https://www.flagstoneim.com/personal/savings-accounts/instant-access", False),
-    "fixed rates": ("https://www.flagstoneim.com/personal/savings-accounts/fixed-rates", False),
+    # Only the ISA page. The instant-access and fixed-rates pages publish no
+    # minimum deposit in their markup, and the sample portfolio covers the same
+    # non-ISA products with a verified minimum, so they are redundant here.
     "cash ISA": ("https://www.flagstoneim.com/personal/cash-isa", True),
 }
 
@@ -504,7 +531,7 @@ def collect() -> list[Product]:
     attempt(
         "Flagstone sample portfolio",
         lambda: parse_flagstone_sample(
-            fetch_rendered(FLAGSTONE_SAMPLE, FLAGSTONE_SAMPLE_READY)
+            fetch_rendered(FLAGSTONE_SAMPLE, FLAGSTONE_SAMPLE_READY, flagstone_prep)
         ),
     )
 
@@ -533,6 +560,8 @@ def top_ten(products: list[Product], source: str | None = None) -> dict[str, lis
             if p.bucket != key:
                 continue
             if source and p.source != source:
+                continue
+            if p.min_deposit is not None and p.min_deposit > AMOUNT:
                 continue
             sig = (p.source, p.bank.lower().strip(), p.rate, p.term_raw.lower())
             if sig in seen:
@@ -613,10 +642,14 @@ def write_sheet(ranked: dict[str, list[Product]], products: list[Product]):
             range_name="A1",
         )
 
-    detail_rows = [["date", "bucket", "rate", "bank", "source", "term_raw"]]
+    detail_rows = [["date", "bucket", "rate", "bank", "source",
+                    "term as listed", "min deposit"]]
     for key, label in BUCKETS:
         for p in ranked[key]:
-            detail_rows.append([today, label, p.rate, p.bank, p.source, p.term_raw])
+            detail_rows.append([
+                today, label, p.rate, p.bank, p.source, p.term_raw,
+                p.min_deposit if p.min_deposit is not None else "not published",
+            ])
 
     detail = sh.worksheet("Detail") if "Detail" in [w.title for w in sh.worksheets()] \
         else sh.add_worksheet("Detail", rows=2000, cols=8)
@@ -663,13 +696,15 @@ def build_xlsx(ranked, products, path: str):
         )
 
     det = wb.create_sheet("Detail")
-    det.append(["bucket", "rank", "rate", "bank", "source", "term as listed"])
+    det.append(["bucket", "rank", "rate", "bank", "source", "term as listed",
+                "min deposit"])
     for c in det[1]:
         c.font = bold
     for key, label in BUCKETS:
         for i, p in enumerate(ranked[key], 1):
-            det.append([label, i, float(p.rate), p.bank, p.source, p.term_raw])
-    for col, w in zip("ABCDEF", (18, 6, 8, 38, 12, 20)):
+            det.append([label, i, float(p.rate), p.bank, p.source, p.term_raw,
+                        p.min_deposit if p.min_deposit is not None else "not published"])
+    for col, w in zip("ABCDEFG", (18, 6, 8, 38, 12, 20, 14)):
         det.column_dimensions[col].width = w
     det.freeze_panes = "A2"
 
@@ -763,6 +798,15 @@ def main():
     thin = [label for key, label in BUCKETS if len(ranked[key]) < 10]
     if thin:
         print(f"\nUnder 10 results: {', '.join(thin)}", file=sys.stderr)
+
+    shown = [p for v in ranked.values() for p in v]
+    unverified = sum(1 for p in shown if p.min_deposit is None)
+    excluded = sum(1 for p in products
+                   if p.min_deposit is not None and p.min_deposit > AMOUNT)
+    print(f"Excluded, minimum above £{AMOUNT:,}: {excluded}", file=sys.stderr)
+    print(f"Shown without a published minimum: {unverified}", file=sys.stderr)
+    HEALTH[f"excluded, min above £{AMOUNT:,}"] = excluded
+    HEALTH["shown, minimum not published"] = unverified
 
     if not args.local:
         write_sheet(ranked, products)
