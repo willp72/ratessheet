@@ -302,22 +302,13 @@ def parse_raisin(html: str, page_kind: str) -> list[Product]:
 
 FLAGSTONE_SAMPLE = "https://clients.direct.flagstoneim.com/build-your-sample-portfolio?accounttype=individual"
 FLAGSTONE_SAMPLE_READY = "article"
-FLAGSTONE_SHOW_MORE = 'button:has-text("Show more")'
-
-
-def flagstone_prep(page):
-    """Exhaust Show more so every product is in the DOM, then filter by
-    minimum deposit ourselves. More reliable than driving the sort control."""
-    got = click_load_more(page, FLAGSTONE_SHOW_MORE, FLAGSTONE_SAMPLE_READY)
-    print(f"    flagstone articles loaded: {got}", file=sys.stderr)
-
 
 def parse_flagstone_sample(html: str) -> list[Product]:
     """
-    The sample portfolio builder renders one <article> per product:
-    "Chetwood Bank Best Flagstone 12 month fixed term 4.83% | 4.83%
-     Rate (AER | Gross) Fixed 12 months Term ..."
-    The first percentage is AER, the second is Gross. Take the first.
+    The sample portfolio renders one <article> per product:
+    "Kent Reliance 4.18% | 4.18% Rate (AER | Gross) Fixed 12 months Term
+     £1,000 - £1,000,000 Min - Max deposit Add"
+    The first percentage is AER, the second Gross. Take the first.
     """
     soup = BeautifulSoup(html, "lxml")
     out = []
@@ -330,13 +321,12 @@ def parse_flagstone_sample(html: str) -> list[Product]:
         rate = float(rates[0])
 
         m = re.search(
-            r"(Fixed\s+\d+\s+(?:month|months|year|years)|Instant Access)", text, re.I
+            r"(Fixed\s+\d+\s+(?:month|months|year|years)|Instant access)", text, re.I
         )
         if not m:
             continue
         term_raw = m.group(1)
 
-        # Bank name is the leading text, before the first percentage or badge.
         bank = re.split(r"\s*(?:Best Flagstone|\d+\.\d+%)", text)[0].strip()
 
         m_dep = re.search(r"(£[\d,]+)\s*[-\u2013]\s*£[\d,]+\s*Min\s*-\s*Max", text)
@@ -346,6 +336,52 @@ def parse_flagstone_sample(html: str) -> list[Product]:
         if bucket:
             out.append(Product("Flagstone", bank or "unknown", rate, term_raw,
                                bucket, False, min_dep))
+    return out
+
+
+FLAGSTONE_PAGES = 5     # ~16 products a page, so ~80. Page 1 is rate-descending.
+
+
+def fetch_flagstone_pages(pages: int = FLAGSTONE_PAGES) -> list[str]:
+    """
+    Return the HTML of the first few pages of the sample portfolio.
+
+    The listing is paginated with numbered buttons, and changing page replaces
+    the articles rather than appending to them, so each page has to be captured
+    as it is shown. Page 1 alone is not enough here: Flagstone sorts by rate
+    descending, and its best rates carry £5,000 minimums that the £1,000 filter
+    strips out, leaving its eligible products on later pages.
+    """
+    from playwright.sync_api import sync_playwright
+
+    out = []
+    with sync_playwright() as p:
+        browser = p.chromium.launch()
+        page = browser.new_page(user_agent=UA, viewport={"width": 1400, "height": 1200})
+        page.goto(FLAGSTONE_SAMPLE, wait_until="domcontentloaded", timeout=45000)
+        dismiss_cookies(page)
+        page.wait_for_selector(FLAGSTONE_SAMPLE_READY, timeout=30000)
+        out.append(page.content())
+
+        # Click the page numbers by their label. Class names here are generated
+        # by styled-components and change on every deploy, so they are useless
+        # as selectors; the digits on the buttons are stable.
+        for n in range(2, pages + 1):
+            try:
+                btn = page.get_by_role("button", name=str(n), exact=True)
+                if btn.count() == 0:
+                    break
+                btn.first.scroll_into_view_if_needed(timeout=5000)
+                btn.first.click(timeout=5000)
+                page.wait_for_timeout(1600)
+                page.wait_for_selector(FLAGSTONE_SAMPLE_READY, timeout=15000)
+                out.append(page.content())
+            except Exception:
+                break
+
+        browser.close()
+
+    print(f"    flagstone pages captured: {len(out)}", file=sys.stderr)
     return out
 
 
@@ -471,7 +507,7 @@ def dismiss_cookies(page):
 RAISIN_LOAD_MORE = '[class*="styles-module_loadMore"] button, button:has-text("Load more")'
 
 
-def raisin_prep(page):
+def raisin_prep(page, warn_on_single_page=True):
     """
     Set the amount, then exhaust the Load more button.
 
@@ -492,7 +528,7 @@ def raisin_prep(page):
 
     got = click_load_more(page, RAISIN_LOAD_MORE, RAISIN_READY)
     print(f"    raisin rows loaded: {got}", file=sys.stderr)
-    if got <= 10:
+    if warn_on_single_page and got <= 10:
         print("    WARNING: Load more did not fire, only page 1 captured", file=sys.stderr)
 
 
@@ -530,9 +566,7 @@ def collect() -> list[Product]:
 
     attempt(
         "Flagstone sample portfolio",
-        lambda: parse_flagstone_sample(
-            fetch_rendered(FLAGSTONE_SAMPLE, FLAGSTONE_SAMPLE_READY, flagstone_prep)
-        ),
+        lambda: [p for h in fetch_flagstone_pages() for p in parse_flagstone_sample(h)],
     )
 
     for kind, (url, isa) in FLAGSTONE.items():
@@ -541,7 +575,8 @@ def collect() -> list[Product]:
             lambda u=url, i=isa: parse_flagstone(fetch_plain(u), i),
         )
 
-    attempt("Raisin easy", lambda: parse_raisin(fetch_rendered(RAISIN_EASY, RAISIN_READY, raisin_prep), "easy"))
+    attempt("Raisin easy", lambda: parse_raisin(fetch_rendered(RAISIN_EASY, RAISIN_READY,
+                                        lambda pg: raisin_prep(pg, warn_on_single_page=False)), "easy"))
     attempt("Raisin fixed", lambda: parse_raisin(fetch_rendered(RAISIN_FIXED, RAISIN_READY, raisin_prep), "fixed"))
 
     return products
