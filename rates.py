@@ -113,7 +113,7 @@ HL_GENERAL = "https://www.hl.co.uk/savings/latest-savings-rates-and-products"
 HL_ISA = "https://www.hl.co.uk/savings/latest-savings-rates-and-products?filter=cash-isa"
 
 
-def parse_hl(html: str, isa: bool) -> list[Product]:
+def parse_hl(html: str, isa: bool, quiet: bool = False) -> list[Product]:
     """See _parse_hl. This wrapper logs what was skipped, so a silent shortfall
     in a term table shows up in the run log instead of only in the report."""
     out, skipped = _parse_hl(html, isa)
@@ -121,6 +121,9 @@ def parse_hl(html: str, isa: bool) -> list[Product]:
 
     # HL prints when it last refreshed against Moneyfacts. If that date is not
     # today's, we are being served a stale page and no parser fix will help.
+    if quiet:
+        return out
+
     stamp = re.search(
         r"last checked against Moneyfacts on\s+([\d]{1,2}\s+\w+\s+\d{4}[^.<]*)",
         re.sub(r"<[^>]+>", " ", html),
@@ -651,6 +654,86 @@ def raisin_prep(page, amount, warn_on_single_page=True):
         print("    WARNING: Load more did not fire, only page 1 captured", file=sys.stderr)
 
 
+
+HL_FILTER_TRIGGER = 'button[aria-haspopup="listbox"]'
+
+
+def fetch_hl_by_term(url: str, isa: bool) -> list[Product]:
+    """
+    Collect HL a term at a time.
+
+    The unfiltered view truncates each term table: on 27 August its 6 month
+    table held 4 rows where the filtered view held 6. The Filter by control is
+    a custom listbox whose options are not in the DOM until it is opened, so
+    they have to be clicked. Falls back to the unfiltered view if the control
+    cannot be driven, which is no worse than before.
+    """
+    from playwright.sync_api import sync_playwright
+
+    products, seen_labels = [], []
+    with sync_playwright() as p:
+        browser = p.chromium.launch()
+        page = browser.new_page(user_agent=UA, viewport={"width": 1400, "height": 1600},
+                                extra_http_headers={"Cache-Control": "no-cache"})
+        page.goto(url, wait_until="domcontentloaded", timeout=45000)
+        dismiss_cookies(page)
+        page.wait_for_selector(HL_READY, timeout=30000)
+
+        hl_prep(page)
+        base = page.content()
+        save_debug("hl-all" + ("-isa" if isa else ""), base)
+        products += parse_hl(base, isa, quiet=True)
+
+        def open_menu():
+            trigger = page.locator(HL_FILTER_TRIGGER).first
+            trigger.scroll_into_view_if_needed(timeout=5000)
+            trigger.click(timeout=5000)
+            page.wait_for_timeout(500)
+
+        try:
+            open_menu()
+            labels = [t.strip() for t in page.locator('[role="option"]').all_inner_texts()
+                      if t.strip()]
+            if not labels:
+                labels = [t.strip() for t in
+                          page.locator('[role="listbox"] li, ul[role] li').all_inner_texts()
+                          if t.strip()]
+            page.keyboard.press("Escape")
+        except Exception as e:
+            print(f"    HL filter menu unavailable ({type(e).__name__}), using All view only",
+                  file=sys.stderr)
+            browser.close()
+            return products
+
+        for label in labels:
+            if label.lower() in ("all", ""):
+                continue
+            try:
+                open_menu()
+                opt = page.get_by_role("option", name=label, exact=True)
+                if opt.count() == 0:
+                    opt = page.get_by_text(label, exact=True)
+                opt.first.click(timeout=5000)
+                page.wait_for_timeout(1200)
+                page.wait_for_selector(HL_READY, timeout=15000)
+                hl_prep(page)
+                products += parse_hl(page.content(), isa, quiet=True)
+                seen_labels.append(label)
+            except Exception:
+                continue
+
+        browser.close()
+
+    tag = "HL ISA" if isa else "HL"
+    print(f"    {tag} term views read: {len(seen_labels)} ({', '.join(seen_labels[:9])})",
+          file=sys.stderr)
+    from collections import Counter
+    per = Counter(p.bucket for p in products)
+    print(f"    {tag} by term: " + ", ".join(f"{k}={v}" for k, v in sorted(per.items())),
+          file=sys.stderr)
+    return products
+
+
 def hl_prep(page):
     got = scroll_until_stable(page, HL_READY)
 
@@ -687,13 +770,8 @@ def collect() -> list[Product]:
             HEALTH[label] = f"FAILED: {type(e).__name__}"
 
     print("Collecting...", file=sys.stderr)
-    def hl_general():
-        html = fetch_rendered(HL_GENERAL, HL_READY, hl_prep)
-        save_debug("hl-general", html)
-        return parse_hl(html, False)
-
-    attempt("HL general", hl_general)
-    attempt("HL ISA", lambda: parse_hl(fetch_rendered(HL_ISA, HL_READY, hl_prep), True))
+    attempt("HL general", lambda: fetch_hl_by_term(HL_GENERAL, False))
+    attempt("HL ISA", lambda: fetch_hl_by_term(HL_ISA, True))
 
     for kind, url in METEOR.items():
         attempt(
