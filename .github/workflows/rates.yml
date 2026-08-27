@@ -24,6 +24,12 @@ jobs:
 
       - run: playwright install --with-deps chromium
 
+      # Where is this runner? HL serves it a reduced page, and if the answer
+      # is "not the UK" that points at geo-gating rather than anything in the
+      # scraper. Costs nothing and settles the question.
+      - name: Runner location
+        run: curl -s https://ipinfo.io/json || true
+
       - name: Collect rates
         env:
           GOOGLE_CREDENTIALS: ${{ secrets.GOOGLE_CREDENTIALS }}
