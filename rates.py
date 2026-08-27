@@ -18,10 +18,15 @@ from dataclasses import dataclass, asdict
 import requests
 from bs4 import BeautifulSoup
 
-# Amount held constant so week-on-week comparisons are like for like.
-# Products whose published minimum exceeds this are excluded: a rate a
-# £1,000 saver cannot actually open is not a rate.
-AMOUNT = 1000
+# No minimum deposit filter. Every product is listed whatever it requires,
+# with the minimum shown in the Detail tab so it can be judged per product.
+#
+# Raisin still needs a figure typed into its amount box, and no single figure
+# reaches everything: a low amount misses products with high minimums, a high
+# one misses products with low maximums. So it runs twice and the results are
+# pooled, with dedupe removing the overlap.
+RAISIN_AMOUNTS = [1000, 50000]
+DEPOSIT_LABEL = "all deposit sizes"
 
 # Anna's report order. Keys are internal, values are the labels in the output.
 BUCKETS = [
@@ -527,7 +532,7 @@ def dismiss_cookies(page):
 RAISIN_LOAD_MORE = '[class*="styles-module_loadMore"] button, button:has-text("Load more")'
 
 
-def raisin_prep(page, warn_on_single_page=True):
+def raisin_prep(page, amount, warn_on_single_page=True):
     """
     Set the amount, then exhaust the Load more button.
 
@@ -539,7 +544,7 @@ def raisin_prep(page, warn_on_single_page=True):
         try:
             box = page.locator(sel).first
             box.click(timeout=3000)
-            box.fill(str(AMOUNT))
+            box.fill(str(amount))
             page.keyboard.press("Enter")
             page.wait_for_timeout(2000)
             break
@@ -598,9 +603,17 @@ def collect() -> list[Product]:
             lambda u=url, i=isa: parse_flagstone(fetch_plain(u), i),
         )
 
-    attempt("Raisin easy", lambda: parse_raisin(fetch_rendered(RAISIN_EASY, RAISIN_READY,
-                                        raisin_prep), "easy"))
-    attempt("Raisin fixed", lambda: parse_raisin(fetch_rendered(RAISIN_FIXED, RAISIN_READY, raisin_prep), "fixed"))
+    # Raisin twice per page, once at each amount, pooled. Products whose range
+    # excludes one amount are picked up by the other; dedupe drops the overlap.
+    for amount in RAISIN_AMOUNTS:
+        for label, url, kind in (("easy", RAISIN_EASY, "easy"),
+                                 ("fixed", RAISIN_FIXED, "fixed")):
+            attempt(
+                f"Raisin {label} £{amount:,}",
+                lambda u=url, k=kind, a=amount: parse_raisin(
+                    fetch_rendered(u, RAISIN_READY,
+                                   lambda pg, amt=a: raisin_prep(pg, amt)), k),
+            )
 
     return products
 
@@ -622,8 +635,6 @@ def top_ten(products: list[Product], source: str | None = None) -> dict[str, lis
             if p.bucket != key:
                 continue
             if source and p.source != source:
-                continue
-            if p.min_deposit is not None and p.min_deposit > AMOUNT:
                 continue
             sig = (p.source, p.bank.lower().strip(), p.rate, p.term_raw.lower())
             if sig in seen:
@@ -685,7 +696,7 @@ def write_sheet(ranked: dict[str, list[Product]], products: list[Product]):
                 else sh.add_worksheet(title, rows=rows_needed, cols=6))
 
     # Pooled report across all four platforms.
-    rows = report_rows(ranked, f"All platforms, {today}, \u00a3{AMOUNT:,} deposit")
+    rows = report_rows(ranked, f"All platforms, {today}, {DEPOSIT_LABEL}")
     rows.append(["Source health"])
     for label, count in HEALTH.items():
         rows.append([label, count])
@@ -700,7 +711,7 @@ def write_sheet(ranked: dict[str, list[Product]], products: list[Product]):
         ws = tab(name)
         ws.clear()
         ws.update(
-            values=report_rows(per, f"{name} only, {today}, \u00a3{AMOUNT:,} deposit"),
+            values=report_rows(per, f"{name} only, {today}, {DEPOSIT_LABEL}"),
             range_name="A1",
         )
 
@@ -744,7 +755,7 @@ def build_xlsx(ranked, products, path: str):
 
     ws = wb.active
     ws.title = "Report"
-    write_block(ws, ranked, f"All platforms, {date.today():%d %B %Y}, \u00a3{AMOUNT:,} deposit")
+    write_block(ws, ranked, f"All platforms, {date.today():%d %B %Y}, {DEPOSIT_LABEL}")
     ws.append(["Source health"])
     ws.cell(ws.max_row, 1).font = bold
     for label, count in HEALTH.items():
@@ -755,7 +766,7 @@ def build_xlsx(ranked, products, path: str):
         write_block(
             per,
             top_ten(products, source=name),
-            f"{name} only, {date.today():%d %B %Y}, \u00a3{AMOUNT:,} deposit",
+            f"{name} only, {date.today():%d %B %Y}, {DEPOSIT_LABEL}",
         )
 
     det = wb.create_sheet("Detail")
@@ -808,7 +819,7 @@ def send_email(ranked, products):
     failed = [k for k, v in HEALTH.items() if isinstance(v, str) or v == 0]
 
     body = [
-        f"Savings rates for {date.today():%d %B %Y}, £{AMOUNT:,} deposit.",
+        f"Savings rates for {date.today():%d %B %Y}, {DEPOSIT_LABEL}.",
         "",
         render_text(ranked).rstrip(),
         "",
@@ -865,11 +876,11 @@ def main():
 
     shown = [p for v in ranked.values() for p in v]
     unverified = sum(1 for p in shown if p.min_deposit is None)
-    excluded = sum(1 for p in products
-                   if p.min_deposit is not None and p.min_deposit > AMOUNT)
-    print(f"Excluded, minimum above £{AMOUNT:,}: {excluded}", file=sys.stderr)
+    mins = sorted({p.min_deposit for p in shown if p.min_deposit is not None})
+    spread = f"£{mins[0]:,.0f} to £{mins[-1]:,.0f}" if mins else "none published"
+    print(f"Minimum deposits in the report: {spread}", file=sys.stderr)
     print(f"Shown without a published minimum: {unverified}", file=sys.stderr)
-    HEALTH[f"excluded, min above £{AMOUNT:,}"] = excluded
+    HEALTH["minimum deposit range"] = spread
     HEALTH["shown, minimum not published"] = unverified
 
     if not args.local:
