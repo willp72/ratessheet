@@ -653,6 +653,19 @@ def raisin_prep(page, amount, warn_on_single_page=True):
 
 def hl_prep(page):
     got = scroll_until_stable(page, HL_READY)
+
+    # HL keeps filling its tables after the row count first goes quiet: rows
+    # are inserted at the top of each term table once a later call returns,
+    # which is why the highest rates were the ones going missing. Settle and
+    # re-check rather than trusting the first plateau.
+    for _ in range(4):
+        page.wait_for_timeout(3000)
+        now = page.locator(HL_READY).count()
+        if now == got:
+            break
+        print(f"    hl rows still arriving: {got} -> {now}", file=sys.stderr)
+        got = scroll_until_stable(page, HL_READY)
+
     print(f"    hl rows after scroll: {got}", file=sys.stderr)
 
 
