@@ -128,7 +128,10 @@ def parse_rate(txt: str) -> float | None:
 # Source: Hargreaves Lansdown  (needs a browser: Next.js hydrates the tables)
 # ---------------------------------------------------------------------------
 
-HL_GENERAL = "https://www.hl.co.uk/savings/latest-savings-rates-and-products"
+# The explicit tab parameter, as it appears in a real visitor's address bar.
+# The bare URL renders the same tables but has never been compared against
+# this, and it is the one difference we have not tested.
+HL_GENERAL = "https://www.hl.co.uk/savings/latest-savings-rates-and-products?filter=active-savings"
 HL_ISA = "https://www.hl.co.uk/savings/latest-savings-rates-and-products?filter=cash-isa"
 
 
