@@ -9,6 +9,7 @@ Run in Actions:   python rates.py
 """
 
 import argparse
+import hashlib
 import json
 import os
 import re
@@ -709,43 +710,42 @@ def fetch_hl_by_term(url: str, isa: bool) -> list[Product]:
         save_debug("hl-all" + ("-isa" if isa else ""), base)
         products += parse_hl(base, isa, quiet=True)
 
-        def open_menu():
-            trigger = page.locator(HL_FILTER_TRIGGER).first
-            trigger.scroll_into_view_if_needed(timeout=5000)
-            trigger.click(timeout=5000)
-            page.wait_for_timeout(500)
+        # Drive the listbox with the keyboard. Its options carry no role or
+        # stable class, and are not in the DOM until it opens, so selecting by
+        # text or role finds nothing. Arrow keys need neither.
+        trigger = page.locator(HL_FILTER_TRIGGER).first
+        seen_html = {hashlib.md5(base.encode()).hexdigest()}
 
-        try:
-            open_menu()
-            labels = [t.strip() for t in page.locator('[role="option"]').all_inner_texts()
-                      if t.strip()]
-            if not labels:
-                labels = [t.strip() for t in
-                          page.locator('[role="listbox"] li, ul[role] li').all_inner_texts()
-                          if t.strip()]
-            page.keyboard.press("Escape")
-        except Exception as e:
-            print(f"    HL filter menu unavailable ({type(e).__name__}), using All view only",
-                  file=sys.stderr)
-            browser.close()
-            return products
-
-        for label in labels:
-            if label.lower() in ("all", ""):
-                continue
+        for index in range(1, 16):
             try:
-                open_menu()
-                opt = page.get_by_role("option", name=label, exact=True)
-                if opt.count() == 0:
-                    opt = page.get_by_text(label, exact=True)
-                opt.first.click(timeout=5000)
-                page.wait_for_timeout(1200)
+                trigger.scroll_into_view_if_needed(timeout=5000)
+                trigger.click(timeout=5000)
+                page.wait_for_timeout(400)
+                for _ in range(index):
+                    page.keyboard.press("ArrowDown")
+                    page.wait_for_timeout(60)
+                page.keyboard.press("Enter")
+                page.wait_for_timeout(1300)
                 page.wait_for_selector(HL_READY, timeout=15000)
-                hl_prep(page)
-                products += parse_hl(page.content(), isa, quiet=True)
-                seen_labels.append(label)
             except Exception:
+                break
+
+            label = (trigger.inner_text() or "").strip().split("\n")[0]
+            hl_prep(page)
+            html = page.content()
+            digest = hashlib.md5(html.encode()).hexdigest()
+
+            if digest in seen_html:
+                # Same view as one already captured: the list has wrapped or
+                # the selection did not take. Nothing more to gain.
+                if label in seen_labels:
+                    break
                 continue
+
+            seen_html.add(digest)
+            products += parse_hl(html, isa, quiet=True)
+            seen_labels.append(label)
+            save_debug(f"hl-view-{index}" + ("-isa" if isa else ""), html)
 
         browser.close()
 
