@@ -675,11 +675,36 @@ def fetch_hl_by_term(url: str, isa: bool) -> list[Product]:
         browser = p.chromium.launch()
         page = browser.new_page(user_agent=UA, viewport={"width": 1400, "height": 1600},
                                 extra_http_headers={"Cache-Control": "no-cache"})
+        # Record JSON traffic. The rates are not in the page source or its
+        # embedded state, so they arrive from an endpoint built in JS at
+        # runtime. That response very likely holds every product, with the
+        # truncation happening in the browser, which would make driving the
+        # filter unnecessary.
+        seen_json = []
+
+        def on_response(resp):
+            try:
+                ctype = resp.headers.get("content-type", "")
+                if "json" not in ctype.lower():
+                    return
+                body = resp.text()
+                if re.search(r"\d\.\d{2}", body) and len(body) > 500:
+                    seen_json.append((resp.url, body))
+            except Exception:
+                pass
+
+        page.on("response", on_response)
+
         page.goto(url, wait_until="domcontentloaded", timeout=45000)
         dismiss_cookies(page)
         page.wait_for_selector(HL_READY, timeout=30000)
 
         hl_prep(page)
+
+        for i, (u, body) in enumerate(seen_json[:8]):
+            hit = "RATES?" if ("AER" in body or "aer" in body) else ""
+            print(f"    HL json [{i}] {len(body):>7,}b {hit} {u[:110]}", file=sys.stderr)
+            save_debug(f"hl-json-{i}" + ("-isa" if isa else ""), body)
         base = page.content()
         save_debug("hl-all" + ("-isa" if isa else ""), base)
         products += parse_hl(base, isa, quiet=True)
