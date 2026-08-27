@@ -114,17 +114,49 @@ HL_ISA = "https://www.hl.co.uk/savings/latest-savings-rates-and-products?filter=
 
 
 def parse_hl(html: str, isa: bool) -> list[Product]:
+    """See _parse_hl. This wrapper logs what was skipped, so a silent shortfall
+    in a term table shows up in the run log instead of only in the report."""
+    out, skipped = _parse_hl(html, isa)
+    from collections import Counter
+
+    # HL prints when it last refreshed against Moneyfacts. If that date is not
+    # today's, we are being served a stale page and no parser fix will help.
+    stamp = re.search(
+        r"last checked against Moneyfacts on\s+([\d]{1,2}\s+\w+\s+\d{4}[^.<]*)",
+        re.sub(r"<[^>]+>", " ", html),
+    )
+    if stamp:
+        when = re.sub(r"\s+", " ", stamp.group(1)).strip()
+        print(f"    HL page says rates last checked: {when}", file=sys.stderr)
+        HEALTH["HL rates last checked"] = when
+    per = Counter(p.bucket for p in out)
+    label = "HL ISA" if isa else "HL"
+    print(f"    {label} by term: " + ", ".join(f"{k}={v}" for k, v in sorted(per.items())),
+          file=sys.stderr)
+    if skipped:
+        top = Counter(skipped).most_common(6)
+        print(f"    {label} skipped rows: " + ", ".join(f"{k}x{v}" for k, v in top),
+              file=sys.stderr)
+    return out
+
+
+def _parse_hl(html: str, isa: bool) -> tuple[list[Product], list[str]]:
     """HL renders one <table> per term with a Bank / AER / Term column set."""
     soup = BeautifulSoup(html, "lxml")
-    out = []
+    out, skipped = [], []
     for table in soup.find_all("table"):
         heads = [th.get_text(" ", strip=True).lower() for th in table.select("thead th")]
-        if not heads or "bank" not in heads[0]:
+        if not heads:
+            skipped.append("table:no-thead")
+            continue
+        if "bank" not in heads[0]:
+            skipped.append(f"table:head0={heads[0][:18]}")
             continue
         try:
             i_aer = next(i for i, h in enumerate(heads) if h == "aer")
             i_term = next(i for i, h in enumerate(heads) if h == "term")
         except StopIteration:
+            skipped.append(f"table:cols={'/'.join(heads)[:40]}")
             continue
         i_min = next((i for i, h in enumerate(heads) if "min opening" in h), None)
 
@@ -141,7 +173,11 @@ def parse_hl(html: str, isa: bool) -> list[Product]:
                        if i_min is not None and len(tds) > i_min else None)
             if rate and bucket:
                 out.append(Product("HL", bank, rate, term_raw, bucket, isa, min_dep))
-    return out
+            elif not rate:
+                skipped.append("row:no-rate")
+            else:
+                skipped.append(f"row:term={term_raw[:18]}")
+    return out, skipped
 
 
 # ---------------------------------------------------------------------------
@@ -465,7 +501,11 @@ def fetch_rendered(url: str, ready: str, prep=None) -> str:
 
     with sync_playwright() as p:
         browser = p.chromium.launch()
-        page = browser.new_page(user_agent=UA, viewport={"width": 1400, "height": 1200})
+        page = browser.new_page(user_agent=UA, viewport={"width": 1400, "height": 1200},
+                                extra_http_headers={
+                                    "Cache-Control": "no-cache",
+                                    "Pragma": "no-cache",
+                                })
         page.goto(url, wait_until="domcontentloaded", timeout=45000)
         dismiss_cookies(page)
         page.wait_for_selector(ready, timeout=30000)
@@ -476,21 +516,28 @@ def fetch_rendered(url: str, ready: str, prep=None) -> str:
     return html
 
 
-def scroll_until_stable(page, selector: str, limit: int = 25) -> int:
-    """Scroll until the number of matching elements stops growing."""
+def scroll_until_stable(page, selector: str, limit: int = 40) -> int:
+    """
+    Scroll until the number of matching elements stops growing.
+
+    Four stalls rather than two: HL renders its term tables lazily and pauses
+    between them, so an impatient loop stops halfway down the page and the
+    later terms never appear.
+    """
     last = -1
     stalls = 0
     for _ in range(limit):
         count = page.locator(selector).count()
         if count == last:
             stalls += 1
-            if stalls >= 2:      # two stalls, not one: lazy loads need a beat
+            if stalls >= 4:
                 break
         else:
             stalls = 0
         last = count
         page.mouse.wheel(0, 5000)
-        page.wait_for_timeout(900)
+        page.keyboard.press("End")
+        page.wait_for_timeout(1100)
     return last
 
 
