@@ -51,12 +51,24 @@ PLATFORM_NOTES = {
            "served to this collector and are not included here."),
 }
 
+# Present as a browser in the UK. HL serves this collector a reduced page,
+# and locale is the cheapest of the possible reasons to rule out.
+UK_CONTEXT = {
+    "user_agent": None,
+    "locale": "en-GB",
+    "timezone_id": "Europe/London",
+    "geolocation": {"latitude": 51.5074, "longitude": -0.1278},
+    "permissions": ["geolocation"],
+}
+
 HEALTH: dict[str, object] = {}
 
 UA = (
     "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
     "(KHTML, like Gecko) Chrome/148.0.0.0 Safari/537.36"
 )
+
+UK_CONTEXT["user_agent"] = UA
 
 
 @dataclass
@@ -416,7 +428,7 @@ def fetch_flagstone_pages(url: str, max_pages: int = FLAGSTONE_MAX_PAGES) -> lis
     out = []
     with sync_playwright() as p:
         browser = p.chromium.launch()
-        page = browser.new_page(user_agent=UA, viewport={"width": 1400, "height": 1200})
+        page = browser.new_page(**UK_CONTEXT, viewport={"width": 1400, "height": 1200})
         page.goto(url, wait_until="domcontentloaded", timeout=45000)
         dismiss_cookies(page)
         page.wait_for_selector(FLAGSTONE_SAMPLE_READY, timeout=30000)
@@ -553,10 +565,11 @@ def fetch_rendered(url: str, ready: str, prep=None) -> str:
 
     with sync_playwright() as p:
         browser = p.chromium.launch()
-        page = browser.new_page(user_agent=UA, viewport={"width": 1400, "height": 1200},
+        page = browser.new_page(**UK_CONTEXT, viewport={"width": 1400, "height": 1200},
                                 extra_http_headers={
                                     "Cache-Control": "no-cache",
                                     "Pragma": "no-cache",
+                                    "Accept-Language": "en-GB,en;q=0.9",
                                 })
         page.goto(url, wait_until="domcontentloaded", timeout=45000)
         dismiss_cookies(page)
@@ -677,8 +690,9 @@ def fetch_hl_by_term(url: str, isa: bool) -> list[Product]:
 
     with sync_playwright() as p:
         browser = p.chromium.launch()
-        page = browser.new_page(user_agent=UA, viewport={"width": 1400, "height": 1600},
-                                extra_http_headers={"Cache-Control": "no-cache"})
+        page = browser.new_page(**UK_CONTEXT, viewport={"width": 1400, "height": 1600},
+                                extra_http_headers={"Cache-Control": "no-cache",
+                                                    "Accept-Language": "en-GB,en;q=0.9"})
         page.goto(url, wait_until="domcontentloaded", timeout=45000)
         dismiss_cookies(page)
         page.wait_for_selector(HL_READY, timeout=30000)
