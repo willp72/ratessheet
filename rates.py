@@ -513,6 +513,23 @@ def fetch_plain(url: str) -> str:
     return r.text
 
 
+DEBUG_DIR = os.environ.get("DEBUG_DIR", "")
+
+
+def save_debug(name: str, html: str):
+    """Write the page the runner actually got, for inspection as an artifact."""
+    if not DEBUG_DIR:
+        return
+    try:
+        os.makedirs(DEBUG_DIR, exist_ok=True)
+        path = os.path.join(DEBUG_DIR, f"{name}.html")
+        with open(path, "w", encoding="utf-8") as fh:
+            fh.write(html)
+        print(f"    saved {path} ({len(html):,} bytes)", file=sys.stderr)
+    except Exception as e:
+        print(f"    debug save failed: {e}", file=sys.stderr)
+
+
 def fetch_rendered(url: str, ready: str, prep=None) -> str:
     """
     Load with a real browser and wait for `ready` to appear.
@@ -657,7 +674,12 @@ def collect() -> list[Product]:
             HEALTH[label] = f"FAILED: {type(e).__name__}"
 
     print("Collecting...", file=sys.stderr)
-    attempt("HL general", lambda: parse_hl(fetch_rendered(HL_GENERAL, HL_READY, hl_prep), False))
+    def hl_general():
+        html = fetch_rendered(HL_GENERAL, HL_READY, hl_prep)
+        save_debug("hl-general", html)
+        return parse_hl(html, False)
+
+    attempt("HL general", hl_general)
     attempt("HL ISA", lambda: parse_hl(fetch_rendered(HL_ISA, HL_READY, hl_prep), True))
 
     for kind, url in METEOR.items():
