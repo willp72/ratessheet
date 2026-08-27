@@ -2,22 +2,15 @@ name: Savings rates
 
 on:
   schedule:
-    # 05:30 UTC daily: 06:30 BST in summer, 05:30 GMT in winter.
-    #
-    # Plain UTC with no timezone field, because that field is not reliably
-    # accepted and a rejected schedule fails silently: the manual button still
-    # works, so nothing looks broken until the email arrives marked [STALE].
-    #
-    # The exact hour does not matter as long as it is hours ahead of the
-    # Apps Script email trigger at 09:00. Scheduled runs routinely slip 5 to 30
-    # minutes, so the gap has to absorb that, not just the 4 minute runtime.
+    # 05:30 UTC daily: 06:30 BST in summer, 05:30 GMT in winter. Hours ahead of
+    # the Apps Script email trigger at 09:00, so a queue delay cannot race it.
     - cron: "30 5 * * *"
-  workflow_dispatch:          # manual "Run workflow" button
+  workflow_dispatch:
 
 jobs:
   collect:
     runs-on: ubuntu-latest
-    timeout-minutes: 20
+    timeout-minutes: 25
 
     steps:
       - uses: actions/checkout@v4
@@ -35,4 +28,16 @@ jobs:
         env:
           GOOGLE_CREDENTIALS: ${{ secrets.GOOGLE_CREDENTIALS }}
           SHEET_ID: ${{ secrets.SHEET_ID }}
+          DEBUG_DIR: debug
         run: python rates.py
+
+      # The page HL serves the runner, kept so it can be compared against what
+      # a browser in the UK sees. Download it from the run's Artifacts section.
+      - name: Upload fetched pages
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: fetched-pages
+          path: debug/
+          retention-days: 7
+          if-no-files-found: ignore
