@@ -45,6 +45,12 @@ BUCKETS = [
 
 SOURCES = ["HL", "Meteor", "Flagstone", "Raisin"]
 
+PLATFORM_NOTES = {
+    "HL": ("HL's own Active Savings range. Its site also republishes Moneyfacts "
+           "market-leading rates for providers not on its platform; those are not "
+           "served to this collector and are not included here."),
+}
+
 HEALTH: dict[str, object] = {}
 
 UA = (
@@ -656,182 +662,31 @@ def raisin_prep(page, amount, warn_on_single_page=True):
 
 
 
-HL_FILTER_TRIGGER = 'button[aria-haspopup="listbox"]'
-
-
 def fetch_hl_by_term(url: str, isa: bool) -> list[Product]:
     """
-    Collect HL a term at a time.
+    Collect HL's Active Savings products.
 
-    The unfiltered view truncates each term table: on 27 August its 6 month
-    table held 4 rows where the filtered view held 6. The Filter by control is
-    a custom listbox whose options are not in the DOM until it is opened, so
-    they have to be clicked. Falls back to the unfiltered view if the control
-    cannot be driven, which is no worse than before.
+    Note on scope: HL's public page also shows Moneyfacts "market-leading"
+    rates for providers that are not on its platform, such as Kent Reliance
+    and Charter Savings. Those are served to a UK browser but not to this
+    runner: they appear nowhere in the HTML it receives, and the term filter
+    is client-side, so no interaction can reveal them. What follows is HL's
+    own Active Savings range, which is what its API returns.
     """
     from playwright.sync_api import sync_playwright
 
-    products, seen_labels = [], []
     with sync_playwright() as p:
         browser = p.chromium.launch()
         page = browser.new_page(user_agent=UA, viewport={"width": 1400, "height": 1600},
                                 extra_http_headers={"Cache-Control": "no-cache"})
-        # Record JSON traffic. The rates are not in the page source or its
-        # embedded state, so they arrive from an endpoint built in JS at
-        # runtime. That response very likely holds every product, with the
-        # truncation happening in the browser, which would make driving the
-        # filter unnecessary.
-        seen_json = []
-
-        def on_response(resp):
-            try:
-                ctype = resp.headers.get("content-type", "")
-                if "json" not in ctype.lower():
-                    return
-                body = resp.text()
-                if re.search(r"\d\.\d{2}", body) and len(body) > 500:
-                    seen_json.append((resp.url, body))
-            except Exception:
-                pass
-
-        page.on("response", on_response)
-
         page.goto(url, wait_until="domcontentloaded", timeout=45000)
         dismiss_cookies(page)
         page.wait_for_selector(HL_READY, timeout=30000)
-
         hl_prep(page)
+        html = page.content()
+        save_debug("hl-all" + ("-isa" if isa else ""), html)
 
-        for i, (u, body) in enumerate(seen_json[:8]):
-            hit = "RATES?" if ("AER" in body or "aer" in body) else ""
-            print(f"    HL json [{i}] {len(body):>7,}b {hit} {u[:110]}", file=sys.stderr)
-            save_debug(f"hl-json-{i}" + ("-isa" if isa else ""), body)
-        base = page.content()
-        save_debug("hl-all" + ("-isa" if isa else ""), base)
-        products += parse_hl(base, isa, quiet=True)
-
-        # Open the filter. React controls often ignore a synthetic click, so
-        # try several ways and check aria-expanded after each rather than
-        # assuming any of them worked.
-        trigger = page.locator(HL_FILTER_TRIGGER).first
-        seen_html = {hashlib.md5(base.encode()).hexdigest()}
-
-        def expanded() -> bool:
-            try:
-                return (trigger.get_attribute("aria-expanded") or "").lower() == "true"
-            except Exception:
-                return False
-
-        def open_menu() -> bool:
-            if expanded():
-                return True
-            for how in ("click", "force", "dispatch", "keyboard"):
-                try:
-                    trigger.scroll_into_view_if_needed(timeout=4000)
-                    if how == "click":
-                        trigger.click(timeout=4000)
-                    elif how == "force":
-                        trigger.click(timeout=4000, force=True)
-                    elif how == "dispatch":
-                        trigger.dispatch_event("click")
-                    else:
-                        trigger.focus()
-                        page.keyboard.press("Enter")
-                    page.wait_for_timeout(600)
-                    if expanded():
-                        print(f"    HL filter opened via {how}", file=sys.stderr)
-                        return True
-                except Exception:
-                    continue
-            return False
-
-        if not open_menu():
-            print("    HL filter would not open, All view only", file=sys.stderr)
-            save_debug("hl-menu-failed" + ("-isa" if isa else ""), page.content())
-        else:
-            # The options are <button> inside <li role="option"> in a
-            # <ul role="listbox">. They need clicking; arrow keys do not move
-            # the component's selection.
-            save_debug("hl-menu-open" + ("-isa" if isa else ""), page.content())
-
-            OPTIONS = 'ul[role="listbox"] li[role="option"]'
-            labels = []
-            try:
-                items = page.locator(OPTIONS)
-                for i in range(items.count()):
-                    labels.append((items.nth(i).inner_text() or "").strip())
-            except Exception:
-                pass
-            print(f"    HL filter options: {labels}", file=sys.stderr)
-            page.keyboard.press("Escape")
-
-            for index, label in enumerate(labels):
-                if label.lower() in ("all", ""):
-                    continue
-                if not open_menu():
-                    break
-
-                # Verify the selection actually took. A click that lands on the
-                # button can update aria-selected without the table re-rendering,
-                # which is what produced two identical captures last run.
-                took = False
-                for how in ("button", "li", "force", "dispatch"):
-                    try:
-                        item = page.locator(OPTIONS).nth(index)
-                        if how == "button":
-                            item.locator("button").click(timeout=4000)
-                        elif how == "li":
-                            item.click(timeout=4000)
-                        elif how == "force":
-                            item.locator("button").click(timeout=4000, force=True)
-                        else:
-                            item.locator("button").dispatch_event("click")
-                        page.wait_for_timeout(1500)
-                        if (trigger.inner_text() or "").strip().startswith(label):
-                            took = True
-                            if index == 1:
-                                print(f"    HL option click works via {how}", file=sys.stderr)
-                            break
-                        if not open_menu():
-                            break
-                    except Exception:
-                        continue
-
-                if not took:
-                    print(f"    HL selection did not take for {label!r}", file=sys.stderr)
-                    if index == 1:
-                        save_debug("hl-after-click" + ("-isa" if isa else ""), page.content())
-                    continue
-
-                try:
-                    page.wait_for_selector(HL_READY, timeout=15000)
-                except Exception:
-                    continue
-
-                hl_prep(page)
-                html = page.content()
-                digest = hashlib.md5(html.encode()).hexdigest()
-                if digest in seen_html:
-                    continue
-                seen_html.add(digest)
-                got = parse_hl(html, isa, quiet=True)
-                products += got
-                seen_labels.append(f"{label}({len(got)})")
-
-            for i, (u, body) in enumerate(seen_json[8:16]):
-                print(f"    HL filtered json [{i}] {len(body):>7,}b {u[:100]}", file=sys.stderr)
-                save_debug(f"hl-filtered-json-{i}" + ("-isa" if isa else ""), body)
-
-        browser.close()
-
-    tag = "HL ISA" if isa else "HL"
-    print(f"    {tag} term views read: {len(seen_labels)} ({', '.join(seen_labels[:9])})",
-          file=sys.stderr)
-    from collections import Counter
-    per = Counter(p.bucket for p in products)
-    print(f"    {tag} by term: " + ", ".join(f"{k}={v}" for k, v in sorted(per.items())),
-          file=sys.stderr)
-    return products
+    return parse_hl(html, isa)
 
 
 def hl_prep(page):
@@ -936,9 +791,12 @@ def top_ten(products: list[Product], source: str | None = None) -> dict[str, lis
     return out
 
 
-def report_rows(ranked: dict[str, list[Product]], title: str) -> list[list]:
+def report_rows(ranked: dict[str, list[Product]], title: str, note: str = "") -> list[list]:
     """The ten tables, rates only, in Anna's order. Used by sheet and xlsx."""
-    rows = [[title], []]
+    rows = [[title]]
+    if note:
+        rows.append([note])
+    rows.append([])
     for key, label in BUCKETS:
         rows.append([label])
         got = ranked[key]
@@ -1001,7 +859,8 @@ def write_sheet(ranked: dict[str, list[Product]], products: list[Product]):
         ws = tab(name)
         ws.clear()
         ws.update(
-            values=report_rows(per, f"{name} only, {today}, {DEPOSIT_LABEL}"),
+            values=report_rows(per, f"{name} only, {today}, {DEPOSIT_LABEL}",
+                               PLATFORM_NOTES.get(name, "")),
             range_name="A1",
         )
 
@@ -1036,8 +895,8 @@ def build_xlsx(ranked, products, path: str):
     bold = Font(name="Arial", bold=True)
     plain = Font(name="Arial")
 
-    def write_block(ws, ranked_set, title):
-        for row in report_rows(ranked_set, title):
+    def write_block(ws, ranked_set, title, note=""):
+        for row in report_rows(ranked_set, title, note):
             ws.append(row if row else [None])
         ws.column_dimensions["A"].width = 28
         ws.column_dimensions["B"].width = 12
@@ -1057,6 +916,7 @@ def build_xlsx(ranked, products, path: str):
             per,
             top_ten(products, source=name),
             f"{name} only, {date.today():%d %B %Y}, {DEPOSIT_LABEL}",
+            PLATFORM_NOTES.get(name, ""),
         )
 
     det = wb.create_sheet("Detail")
