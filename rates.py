@@ -56,6 +56,7 @@ class Product:
     bucket: str
     isa: bool
     min_deposit: float | None = None    # None means the source does not publish one
+    view: str = ""                      # which listing it came from, e.g. "joint"
 
 
 # ---------------------------------------------------------------------------
@@ -300,10 +301,17 @@ def parse_raisin(html: str, page_kind: str) -> list[Product]:
 # Source: Flagstone ISA page  (schema.org JSON in the HTML, plain fetch)
 # ---------------------------------------------------------------------------
 
-FLAGSTONE_SAMPLE = "https://clients.direct.flagstoneim.com/build-your-sample-portfolio?accounttype=individual"
+# Flagstone is the only platform that splits its listing by account type in
+# the URL. HL, Meteor and Raisin show one personal table covering both, so
+# individual and joint only need handling here.
+_FS = "https://clients.direct.flagstoneim.com/build-your-sample-portfolio?accounttype="
+FLAGSTONE_SAMPLE_TYPES = {
+    "individual": _FS + "individual",
+    "joint": _FS + "joint",
+}
 FLAGSTONE_SAMPLE_READY = "article"
 
-def parse_flagstone_sample(html: str) -> list[Product]:
+def parse_flagstone_sample(html: str, view: str = "") -> list[Product]:
     """
     The sample portfolio renders one <article> per product:
     "Kent Reliance 4.18% | 4.18% Rate (AER | Gross) Fixed 12 months Term
@@ -335,14 +343,14 @@ def parse_flagstone_sample(html: str) -> list[Product]:
         bucket = normalise_term(term_raw, isa=False)
         if bucket:
             out.append(Product("Flagstone", bank or "unknown", rate, term_raw,
-                               bucket, False, min_dep))
+                               bucket, False, min_dep, view))
     return out
 
 
 FLAGSTONE_PAGES = 5     # ~16 products a page, so ~80. Page 1 is rate-descending.
 
 
-def fetch_flagstone_pages(pages: int = FLAGSTONE_PAGES) -> list[str]:
+def fetch_flagstone_pages(url: str, pages: int = FLAGSTONE_PAGES) -> list[str]:
     """
     Return the HTML of the first few pages of the sample portfolio.
 
@@ -358,7 +366,7 @@ def fetch_flagstone_pages(pages: int = FLAGSTONE_PAGES) -> list[str]:
     with sync_playwright() as p:
         browser = p.chromium.launch()
         page = browser.new_page(user_agent=UA, viewport={"width": 1400, "height": 1200})
-        page.goto(FLAGSTONE_SAMPLE, wait_until="domcontentloaded", timeout=45000)
+        page.goto(url, wait_until="domcontentloaded", timeout=45000)
         dismiss_cookies(page)
         page.wait_for_selector(FLAGSTONE_SAMPLE_READY, timeout=30000)
         out.append(page.content())
@@ -564,10 +572,13 @@ def collect() -> list[Product]:
             lambda u=url: [p for h in meteor_pages(u) for p in parse_meteor(h)],
         )
 
-    attempt(
-        "Flagstone sample portfolio",
-        lambda: [p for h in fetch_flagstone_pages() for p in parse_flagstone_sample(h)],
-    )
+    for acct, url in FLAGSTONE_SAMPLE_TYPES.items():
+        attempt(
+            f"Flagstone {acct}",
+            lambda u=url, a=acct: [
+                p for h in fetch_flagstone_pages(u) for p in parse_flagstone_sample(h, a)
+            ],
+        )
 
     for kind, (url, isa) in FLAGSTONE.items():
         attempt(
@@ -587,6 +598,10 @@ def top_ten(products: list[Product], source: str | None = None) -> dict[str, lis
     Rank within each bucket. Duplicates across platforms are kept, as requested,
     but the exact same listing scraped twice from one platform is not a duplicate,
     it's a double count. Those are dropped.
+
+    The dedupe signature deliberately ignores `view`, so a product offered to
+    both individual and joint holders takes one slot rather than two, while a
+    product only available on one of them still gets in.
     """
     out = {}
     for key, _ in BUCKETS:
@@ -678,12 +693,13 @@ def write_sheet(ranked: dict[str, list[Product]], products: list[Product]):
         )
 
     detail_rows = [["date", "bucket", "rate", "bank", "source",
-                    "term as listed", "min deposit"]]
+                    "term as listed", "min deposit", "listing"]]
     for key, label in BUCKETS:
         for p in ranked[key]:
             detail_rows.append([
                 today, label, p.rate, p.bank, p.source, p.term_raw,
                 p.min_deposit if p.min_deposit is not None else "not published",
+                p.view or "personal",
             ])
 
     detail = sh.worksheet("Detail") if "Detail" in [w.title for w in sh.worksheets()] \
@@ -732,14 +748,15 @@ def build_xlsx(ranked, products, path: str):
 
     det = wb.create_sheet("Detail")
     det.append(["bucket", "rank", "rate", "bank", "source", "term as listed",
-                "min deposit"])
+                "min deposit", "listing"])
     for c in det[1]:
         c.font = bold
     for key, label in BUCKETS:
         for i, p in enumerate(ranked[key], 1):
             det.append([label, i, float(p.rate), p.bank, p.source, p.term_raw,
-                        p.min_deposit if p.min_deposit is not None else "not published"])
-    for col, w in zip("ABCDEFG", (18, 6, 8, 38, 12, 20, 14)):
+                        p.min_deposit if p.min_deposit is not None else "not published",
+                        p.view or "personal"])
+    for col, w in zip("ABCDEFGH", (18, 6, 8, 38, 12, 20, 14, 12)):
         det.column_dimensions[col].width = w
     det.freeze_panes = "A2"
 
