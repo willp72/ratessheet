@@ -768,15 +768,44 @@ def fetch_hl_by_term(url: str, isa: bool) -> list[Product]:
             for index, label in enumerate(labels):
                 if label.lower() in ("all", ""):
                     continue
+                if not open_menu():
+                    break
+
+                # Verify the selection actually took. A click that lands on the
+                # button can update aria-selected without the table re-rendering,
+                # which is what produced two identical captures last run.
+                took = False
+                for how in ("button", "li", "force", "dispatch"):
+                    try:
+                        item = page.locator(OPTIONS).nth(index)
+                        if how == "button":
+                            item.locator("button").click(timeout=4000)
+                        elif how == "li":
+                            item.click(timeout=4000)
+                        elif how == "force":
+                            item.locator("button").click(timeout=4000, force=True)
+                        else:
+                            item.locator("button").dispatch_event("click")
+                        page.wait_for_timeout(1500)
+                        if (trigger.inner_text() or "").strip().startswith(label):
+                            took = True
+                            if index == 1:
+                                print(f"    HL option click works via {how}", file=sys.stderr)
+                            break
+                        if not open_menu():
+                            break
+                    except Exception:
+                        continue
+
+                if not took:
+                    print(f"    HL selection did not take for {label!r}", file=sys.stderr)
+                    if index == 1:
+                        save_debug("hl-after-click" + ("-isa" if isa else ""), page.content())
+                    continue
+
                 try:
-                    if not open_menu():
-                        break
-                    page.locator(OPTIONS).nth(index).locator("button").click(timeout=5000)
-                    page.wait_for_timeout(1300)
                     page.wait_for_selector(HL_READY, timeout=15000)
-                except Exception as e:
-                    print(f"    HL could not select {label!r}: {type(e).__name__}",
-                          file=sys.stderr)
+                except Exception:
                     continue
 
                 hl_prep(page)
@@ -785,8 +814,13 @@ def fetch_hl_by_term(url: str, isa: bool) -> list[Product]:
                 if digest in seen_html:
                     continue
                 seen_html.add(digest)
-                products += parse_hl(html, isa, quiet=True)
-                seen_labels.append(label)
+                got = parse_hl(html, isa, quiet=True)
+                products += got
+                seen_labels.append(f"{label}({len(got)})")
+
+            for i, (u, body) in enumerate(seen_json[8:16]):
+                print(f"    HL filtered json [{i}] {len(body):>7,}b {u[:100]}", file=sys.stderr)
+                save_debug(f"hl-filtered-json-{i}" + ("-isa" if isa else ""), body)
 
         browser.close()
 
