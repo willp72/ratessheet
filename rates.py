@@ -749,47 +749,44 @@ def fetch_hl_by_term(url: str, isa: bool) -> list[Product]:
             print("    HL filter would not open, All view only", file=sys.stderr)
             save_debug("hl-menu-failed" + ("-isa" if isa else ""), page.content())
         else:
-            # Record the open menu once so its options can be inspected.
+            # The options are <button> inside <li role="option"> in a
+            # <ul role="listbox">. They need clicking; arrow keys do not move
+            # the component's selection.
             save_debug("hl-menu-open" + ("-isa" if isa else ""), page.content())
-            opts = []
-            for sel in ('[role="option"]', '[role="listbox"] *', 'ul li button',
-                        'ul li', '[aria-expanded="true"] + * *'):
-                try:
-                    texts = [t.strip() for t in page.locator(sel).all_inner_texts()
-                             if t.strip() and len(t.strip()) < 30]
-                    if texts:
-                        opts = texts
-                        print(f"    HL options via {sel!r}: {texts[:14]}", file=sys.stderr)
-                        break
-                except Exception:
-                    continue
+
+            OPTIONS = 'ul[role="listbox"] li[role="option"]'
+            labels = []
+            try:
+                items = page.locator(OPTIONS)
+                for i in range(items.count()):
+                    labels.append((items.nth(i).inner_text() or "").strip())
+            except Exception:
+                pass
+            print(f"    HL filter options: {labels}", file=sys.stderr)
             page.keyboard.press("Escape")
 
-            for index in range(1, 16):
-                if not open_menu():
-                    break
+            for index, label in enumerate(labels):
+                if label.lower() in ("all", ""):
+                    continue
                 try:
-                    for _ in range(index):
-                        page.keyboard.press("ArrowDown")
-                        page.wait_for_timeout(70)
-                    page.keyboard.press("Enter")
+                    if not open_menu():
+                        break
+                    page.locator(OPTIONS).nth(index).locator("button").click(timeout=5000)
                     page.wait_for_timeout(1300)
                     page.wait_for_selector(HL_READY, timeout=15000)
-                except Exception:
-                    break
+                except Exception as e:
+                    print(f"    HL could not select {label!r}: {type(e).__name__}",
+                          file=sys.stderr)
+                    continue
 
-                label = (trigger.inner_text() or "").strip().split("\n")[0]
                 hl_prep(page)
                 html = page.content()
                 digest = hashlib.md5(html.encode()).hexdigest()
                 if digest in seen_html:
-                    if label in seen_labels:
-                        break
                     continue
                 seen_html.add(digest)
                 products += parse_hl(html, isa, quiet=True)
                 seen_labels.append(label)
-                save_debug(f"hl-view-{index}" + ("-isa" if isa else ""), html)
 
         browser.close()
 
