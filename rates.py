@@ -710,42 +710,86 @@ def fetch_hl_by_term(url: str, isa: bool) -> list[Product]:
         save_debug("hl-all" + ("-isa" if isa else ""), base)
         products += parse_hl(base, isa, quiet=True)
 
-        # Drive the listbox with the keyboard. Its options carry no role or
-        # stable class, and are not in the DOM until it opens, so selecting by
-        # text or role finds nothing. Arrow keys need neither.
+        # Open the filter. React controls often ignore a synthetic click, so
+        # try several ways and check aria-expanded after each rather than
+        # assuming any of them worked.
         trigger = page.locator(HL_FILTER_TRIGGER).first
         seen_html = {hashlib.md5(base.encode()).hexdigest()}
 
-        for index in range(1, 16):
+        def expanded() -> bool:
             try:
-                trigger.scroll_into_view_if_needed(timeout=5000)
-                trigger.click(timeout=5000)
-                page.wait_for_timeout(400)
-                for _ in range(index):
-                    page.keyboard.press("ArrowDown")
-                    page.wait_for_timeout(60)
-                page.keyboard.press("Enter")
-                page.wait_for_timeout(1300)
-                page.wait_for_selector(HL_READY, timeout=15000)
+                return (trigger.get_attribute("aria-expanded") or "").lower() == "true"
             except Exception:
-                break
+                return False
 
-            label = (trigger.inner_text() or "").strip().split("\n")[0]
-            hl_prep(page)
-            html = page.content()
-            digest = hashlib.md5(html.encode()).hexdigest()
+        def open_menu() -> bool:
+            if expanded():
+                return True
+            for how in ("click", "force", "dispatch", "keyboard"):
+                try:
+                    trigger.scroll_into_view_if_needed(timeout=4000)
+                    if how == "click":
+                        trigger.click(timeout=4000)
+                    elif how == "force":
+                        trigger.click(timeout=4000, force=True)
+                    elif how == "dispatch":
+                        trigger.dispatch_event("click")
+                    else:
+                        trigger.focus()
+                        page.keyboard.press("Enter")
+                    page.wait_for_timeout(600)
+                    if expanded():
+                        print(f"    HL filter opened via {how}", file=sys.stderr)
+                        return True
+                except Exception:
+                    continue
+            return False
 
-            if digest in seen_html:
-                # Same view as one already captured: the list has wrapped or
-                # the selection did not take. Nothing more to gain.
-                if label in seen_labels:
+        if not open_menu():
+            print("    HL filter would not open, All view only", file=sys.stderr)
+            save_debug("hl-menu-failed" + ("-isa" if isa else ""), page.content())
+        else:
+            # Record the open menu once so its options can be inspected.
+            save_debug("hl-menu-open" + ("-isa" if isa else ""), page.content())
+            opts = []
+            for sel in ('[role="option"]', '[role="listbox"] *', 'ul li button',
+                        'ul li', '[aria-expanded="true"] + * *'):
+                try:
+                    texts = [t.strip() for t in page.locator(sel).all_inner_texts()
+                             if t.strip() and len(t.strip()) < 30]
+                    if texts:
+                        opts = texts
+                        print(f"    HL options via {sel!r}: {texts[:14]}", file=sys.stderr)
+                        break
+                except Exception:
+                    continue
+            page.keyboard.press("Escape")
+
+            for index in range(1, 16):
+                if not open_menu():
                     break
-                continue
+                try:
+                    for _ in range(index):
+                        page.keyboard.press("ArrowDown")
+                        page.wait_for_timeout(70)
+                    page.keyboard.press("Enter")
+                    page.wait_for_timeout(1300)
+                    page.wait_for_selector(HL_READY, timeout=15000)
+                except Exception:
+                    break
 
-            seen_html.add(digest)
-            products += parse_hl(html, isa, quiet=True)
-            seen_labels.append(label)
-            save_debug(f"hl-view-{index}" + ("-isa" if isa else ""), html)
+                label = (trigger.inner_text() or "").strip().split("\n")[0]
+                hl_prep(page)
+                html = page.content()
+                digest = hashlib.md5(html.encode()).hexdigest()
+                if digest in seen_html:
+                    if label in seen_labels:
+                        break
+                    continue
+                seen_html.add(digest)
+                products += parse_hl(html, isa, quiet=True)
+                seen_labels.append(label)
+                save_debug(f"hl-view-{index}" + ("-isa" if isa else ""), html)
 
         browser.close()
 
