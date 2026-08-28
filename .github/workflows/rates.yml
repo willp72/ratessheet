@@ -2,15 +2,21 @@ name: Savings rates
 
 on:
   schedule:
-    # 05:30 UTC daily: 06:30 BST in summer, 05:30 GMT in winter. Hours ahead of
-    # the Apps Script email trigger at 09:00, so a queue delay cannot race it.
-    - cron: "30 5 * * *"
+    # Two runs, both well before the 09:00 email. If the first fails or does
+    # not fire, the second still writes fresh figures and the email is clean.
+    - cron: "30 5 * * *"    # 05:30 UTC
+    - cron: "15 7 * * *"    # 07:15 UTC, backup
   workflow_dispatch:
+
+# A backup run starting while the first is still going would race the sheet.
+concurrency:
+  group: savings-rates
+  cancel-in-progress: false
 
 jobs:
   collect:
     runs-on: ubuntu-latest
-    timeout-minutes: 25
+    timeout-minutes: 30
 
     steps:
       - uses: actions/checkout@v4
@@ -24,21 +30,29 @@ jobs:
 
       - run: playwright install --with-deps chromium
 
-      # Where is this runner? HL serves it a reduced page, and if the answer
-      # is "not the UK" that points at geo-gating rather than anything in the
-      # scraper. Costs nothing and settles the question.
       - name: Runner location
         run: curl -s https://ipinfo.io/json || true
 
+      # Three attempts. Most failures here are a site being slow or a browser
+      # step timing out, and those rarely repeat back to back.
       - name: Collect rates
         env:
           GOOGLE_CREDENTIALS: ${{ secrets.GOOGLE_CREDENTIALS }}
           SHEET_ID: ${{ secrets.SHEET_ID }}
           DEBUG_DIR: debug
-        run: python rates.py
+        run: |
+          for attempt in 1 2 3; do
+            echo "=== attempt $attempt ==="
+            if python rates.py; then
+              echo "=== attempt $attempt succeeded ==="
+              exit 0
+            fi
+            echo "=== attempt $attempt failed ==="
+            sleep 30
+          done
+          echo "All three attempts failed."
+          exit 1
 
-      # The page HL serves the runner, kept so it can be compared against what
-      # a browser in the UK sees. Download it from the run's Artifacts section.
       - name: Upload fetched pages
         if: always()
         uses: actions/upload-artifact@v4
