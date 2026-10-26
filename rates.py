@@ -646,24 +646,41 @@ def scroll_until_stable(page, selector: str, limit: int = 40) -> int:
     return last
 
 
-def click_load_more(page, button, selector: str, limit: int = 30) -> int:
+def click_load_more(page, button, selector: str, limit: int = 40) -> int:
     """
-    Click a 'Load more' button until it disappears.
+    Click a 'Load more' button until the listing stops growing.
 
-    Raisin paginates behind a button rather than on scroll, so no amount of
-    wheeling will reveal rows 11 onwards.
+    Driven by the item count, not the button's presence. Raisin's button is in
+    the DOM from first paint and stays there after the last page, so "click
+    until it disappears" either spins pointlessly or stops on the first
+    hiccup. Growth is the only reliable evidence a click did anything, and the
+    wait after each click is adaptive rather than a fixed pause.
     """
-    for i in range(limit):
-        btn = page.locator(button)
+    count = page.locator(selector).count()
+    start = count
+
+    for _ in range(limit):
         try:
-            if btn.count() == 0 or not btn.first.is_visible():
+            btn = page.locator(button).first
+            if btn.count() == 0 or not btn.is_visible():
                 break
-            btn.first.scroll_into_view_if_needed(timeout=5000)
-            btn.first.click(timeout=5000)
-            page.wait_for_timeout(1200)
+            btn.scroll_into_view_if_needed(timeout=5000)
+            btn.click(timeout=5000)
         except Exception:
             break
-    return page.locator(selector).count()
+
+        before = count
+        for _ in range(12):                 # up to ~5s for new rows to land
+            page.wait_for_timeout(400)
+            count = page.locator(selector).count()
+            if count > before:
+                break
+        if count == before:                 # click achieved nothing: end of list
+            break
+
+    if start and count > start:
+        print(f"    load more: {start} -> {count}", file=sys.stderr)
+    return count
 
 
 def dismiss_cookies(page):
@@ -681,9 +698,12 @@ def dismiss_cookies(page):
             continue
 
 
-# "Load more offers" in the current design, "Load more" previously. has-text
-# matches on substring, so the shorter form covers both.
-RAISIN_LOAD_MORE = 'button:has-text("Load more")'
+# The button exposes aria-label="Load more offers"; its visible text sits in a
+# nested div, so match the label first and fall back to text. It reads "Load
+# more offers" now and "Load more" before, and both selectors are substring
+# matches, so the shorter form covers either.
+RAISIN_LOAD_MORE = ('button[aria-label*="Load more" i], '
+                    'button:has-text("Load more")')
 
 
 def raisin_prep(page, amount, warn_on_single_page=True):
@@ -694,6 +714,19 @@ def raisin_prep(page, amount, warn_on_single_page=True):
     reorders those 10, which is why an earlier run returned five year bonds and
     nothing else. No sort is needed once every row is loaded, we rank ourselves.
     """
+    seen_api = set()
+
+    def on_response(resp):
+        try:
+            u = resp.url
+            if "api" in u and resp.request.resource_type in ("xhr", "fetch"):
+                if "json" in resp.headers.get("content-type", "").lower():
+                    seen_api.add(u.split("?")[0])
+        except Exception:
+            pass
+
+    page.on("response", on_response)
+
     # The deposit box names itself; the positional fallbacks are a safety net.
     for sel in ('input[name="depositAmount"]', "input[inputmode='numeric']",
                 "input[type='text']"):
@@ -709,6 +742,14 @@ def raisin_prep(page, amount, warn_on_single_page=True):
 
     got = click_load_more(page, RAISIN_LOAD_MORE, RAISIN_READY)
     print(f"    raisin rows loaded: {got}", file=sys.stderr)
+
+    # Raisin's page JSON carries full structured records for the first batch
+    # only (id, termNormalized.months, interestRateEffective, and a minimum
+    # balance it never prints in the HTML). Paging must therefore call an API.
+    # Naming it here costs nothing and would let this source drop the browser
+    # entirely, the way Meteor and Flagstone already have.
+    for u in sorted(seen_api)[:6]:
+        print(f"    raisin api: {u[:120]}", file=sys.stderr)
     if warn_on_single_page and got <= 10:
         print("    WARNING: Load more did not fire, only page 1 captured", file=sys.stderr)
 
