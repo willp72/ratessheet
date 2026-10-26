@@ -119,8 +119,21 @@ def parse_money(txt: str) -> float | None:
     return float(m.group(1).replace(",", "")) if m else None
 
 
-def parse_rate(txt: str) -> float | None:
+def parse_rate(txt) -> float | None:
+    """
+    A rate from text.
+
+    Flagstone's schema.org blocks used to carry "4.45%" and now carry a bare
+    "4.65", so a percent sign can no longer be required: demanding one returned
+    None for every product and the platform silently reported zero. The bare
+    form is accepted only when the whole string is a number, so a stray figure
+    inside a longer sentence is still ignored.
+    """
+    txt = str(txt)
     m = re.search(r"(\d+\.\d+)\s*%", txt)
+    if m:
+        return float(m.group(1))
+    m = re.fullmatch(r"\s*(\d+(?:\.\d+)?)\s*", txt)
     return float(m.group(1)) if m else None
 
 
@@ -328,7 +341,12 @@ def parse_meteor(html: str) -> list[Product]:
 # Source: Raisin  (needs a browser; sort by term to force all rows to render)
 # ---------------------------------------------------------------------------
 
-RAISIN_READY = '[class*="styles-module_rate__"]'
+# Raisin's product cards carry a data-testid with the product code, e.g.
+# dcms-product-table-block-offer-list-card-RCU403. That is stable across
+# deploys; the styled-components class names next to it are build hashes that
+# change every release, and keying on one of those is what broke this source.
+RAISIN_CARD = '[data-testid^="dcms-product-table-block-offer-list-card"]'
+RAISIN_READY = RAISIN_CARD
 HL_READY = "table tbody tr"
 
 RAISIN_EASY = "https://www.raisin.com/en-gb/savings-accounts/easy-access-savings-accounts/"
@@ -336,29 +354,43 @@ RAISIN_FIXED = "https://www.raisin.com/en-gb/savings-accounts/fixed-rate-bonds/"
 
 
 def parse_raisin(html: str, page_kind: str) -> list[Product]:
+    """
+    Parse Raisin's product cards.
+
+    A card reads, in one run of text:
+        "RCI Bank 5.10 % AER 3 years \u00b7 £ 120,000.00 +£ 8,046.78 Details Save now"
+    An easy access card is the same without the term. The bank name leads the
+    card and is taken from the text rather than a logo's alt attribute, and the
+    term is anchored on AER rather than the old trailing "Max.", which the
+    redesign removed. Badges such as "Sharia account" trail the card and so sit
+    outside both captures.
+    """
     soup = BeautifulSoup(html, "lxml")
     out = []
-    for cell in soup.select('[class*="styles-module_rate__"]'):
-        row = cell.parent
-        text = re.sub(r"\s+", " ", row.get_text(" ")).strip()
-        rate = parse_rate(text)
-        if not rate:
+    for card in soup.select(RAISIN_CARD):
+        text = re.sub(r"\s+", " ", card.get_text(" ", strip=True))
+
+        m = re.search(r"(\d+\.\d+)\s*%\s*AER", text)
+        if not m:
             continue
+        rate = float(m.group(1))
+
+        bank = text[:m.start()].strip(" \u00b7|-") or "unknown"
 
         if page_kind == "easy":
             term_raw = "Easy Access"
         else:
-            m = re.search(r"AER\s+(.+?)\s+Max", text)
-            term_raw = m.group(1) if m else ""
-            # Raisin appends badges: "1 Year Sharia account", "6 months Easy access"
-            term_raw = re.split(r"\s+(?:Sharia|Easy)\b", term_raw)[0].strip()
+            m_term = re.search(
+                r"AER\s+(\d+(?:\.\d+)?\s*(?:month|months|year|years))", text, re.I
+            )
+            if not m_term:
+                continue
+            term_raw = m_term.group(1)
 
         bucket = normalise_term(term_raw, isa=False)
         if not bucket:
             continue
 
-        img = row.find("img", alt=True)
-        bank = img["alt"] if img else "unknown"
         out.append(Product("Raisin", bank, rate, term_raw, bucket, False))
     return out
 
@@ -649,7 +681,9 @@ def dismiss_cookies(page):
             continue
 
 
-RAISIN_LOAD_MORE = '[class*="styles-module_loadMore"] button, button:has-text("Load more")'
+# "Load more offers" in the current design, "Load more" previously. has-text
+# matches on substring, so the shorter form covers both.
+RAISIN_LOAD_MORE = 'button:has-text("Load more")'
 
 
 def raisin_prep(page, amount, warn_on_single_page=True):
@@ -660,7 +694,9 @@ def raisin_prep(page, amount, warn_on_single_page=True):
     reorders those 10, which is why an earlier run returned five year bonds and
     nothing else. No sort is needed once every row is loaded, we rank ourselves.
     """
-    for sel in ("input[inputmode='numeric']", "input[type='text']"):
+    # The deposit box names itself; the positional fallbacks are a safety net.
+    for sel in ('input[name="depositAmount"]', "input[inputmode='numeric']",
+                "input[type='text']"):
         try:
             box = page.locator(sel).first
             box.click(timeout=3000)
