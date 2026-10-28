@@ -9,12 +9,11 @@ Run in Actions:   python rates.py
 """
 
 import argparse
-import hashlib
 import json
 import os
 import re
 import sys
-from dataclasses import dataclass, asdict
+from dataclasses import dataclass
 
 import requests
 from bs4 import BeautifulSoup
@@ -474,18 +473,52 @@ def _first_article(page) -> str:
         return ""
 
 
+def _flagstone_results(page) -> str:
+    """The page's own count, e.g. "27" from "Results (27)". Diagnostic only."""
+    try:
+        m = re.search(r"Results \((\d+)\)", page.inner_text("body", timeout=3000))
+        return m.group(1) if m else "?"
+    except Exception:
+        return "?"
+
+
+def _expand_terms(page):
+    """
+    Open the collapsed block of less common terms if it is closed.
+
+    Only the popular terms (Instant Access, 6 and 12 months, 90-95 days) show
+    on load. 7-9 months, 2, 3 and 5+ years sit behind a "Show more" toggle,
+    and a click on a label inside a collapsed block misses. Decided on the
+    toggle's aria-expanded rather than the label's visibility, because a
+    collapsed block can report its contents as visible while clipping them
+    out of reach. Once open the button reads "Show less", so this is a no-op.
+    Called before every filter in case clearing collapses it again.
+    """
+    try:
+        more = page.get_by_role("button", name="Show more", exact=True)
+        if more.count() and (more.first.get_attribute("aria-expanded") or "") != "true":
+            more.first.click(timeout=4000)
+            page.wait_for_timeout(500)
+    except Exception:
+        pass
+
+
 def fetch_flagstone_filtered(url: str, view: str) -> list[Product]:
     """
     Read the sample portfolio once per term rather than paging the whole list.
 
     The filter only decides which products are on screen; the bucket still
     comes from each article's own text, so a filter that selects loosely (the
-    7-9 month one, say) costs nothing. Falls back to paging if the filter
-    controls cannot be found at all.
+    7-9 month one, say) costs nothing. If the filters are missing, or any of
+    them fails, the old paging pass runs as well and the two are pooled, so a
+    failure here can never leave Flagstone worse off than paging alone.
     """
     from playwright.sync_api import sync_playwright
 
     products: list[Product] = []
+    failed: list[str] = []
+    filters_present = True
+
     with sync_playwright() as p:
         browser = p.chromium.launch()
         page = browser.new_page(**UK_CONTEXT, viewport={"width": 1400, "height": 1200})
@@ -494,57 +527,59 @@ def fetch_flagstone_filtered(url: str, view: str) -> list[Product]:
         page.wait_for_selector(FLAGSTONE_SAMPLE_READY, timeout=30000)
 
         if page.locator('[data-heap-id^="term-length-filter"]').count() == 0:
-            print("    flagstone: term filters absent, paging instead", file=sys.stderr)
-            browser.close()
-            return [q for h in fetch_flagstone_pages(url)
-                    for q in parse_flagstone_sample(h, view)]
-
-        for label, fid in FLAGSTONE_TERM_FILTERS:
-            hook = f'[data-heap-id="term-length-filter-{fid}-checkbox"]'
-            try:
-                # Reset first: the filters are additive, so without this each
-                # term would be read on top of the last.
+            filters_present = False
+        else:
+            for label, fid in FLAGSTONE_TERM_FILTERS:
+                hook = f'[data-heap-id="term-length-filter-{fid}-checkbox"]'
                 try:
-                    page.get_by_text("Clear all", exact=False).first.click(timeout=3000)
-                    page.wait_for_timeout(700)
-                except Exception:
-                    pass
+                    # Reset first: the filters are additive. The button is
+                    # disabled when nothing is ticked, so skip it then rather
+                    # than wait out a click timeout.
+                    clear = page.get_by_role("button", name="Clear all", exact=True)
+                    if clear.count() and clear.first.is_enabled():
+                        clear.first.click(timeout=3000)
+                        page.wait_for_timeout(700)
 
-                before_click = _first_article(page)
+                    if page.locator(hook).count() == 0:
+                        print(f"    flagstone {label}: no {fid} filter", file=sys.stderr)
+                        failed.append(label)
+                        continue
 
-                box = page.locator(hook)
-                if box.count() == 0:
-                    print(f"    flagstone {label}: no {fid} filter", file=sys.stderr)
+                    _expand_terms(page)
+                    before_click = _first_article(page)
+                    lab = page.locator(f"label:has({hook})").first
+                    lab.scroll_into_view_if_needed(timeout=4000)
+                    lab.click(timeout=5000)
+
+                    # Wait for the list to actually redraw rather than a fixed
+                    # pause, so a slow response cannot leave the previous
+                    # term's products on screen to be parsed as this one's.
+                    for _ in range(15):
+                        page.wait_for_timeout(400)
+                        now = _first_article(page)
+                        if now and now != before_click:
+                            break
+                    page.wait_for_selector(FLAGSTONE_SAMPLE_READY, timeout=15000)
+                except Exception as e:
+                    print(f"    flagstone {label}: filter failed, {type(e).__name__}",
+                          file=sys.stderr)
+                    failed.append(label)
                     continue
 
-                # The input is a styled checkbox, usually not clickable itself,
-                # so click the label that wraps it and fall back to the input.
-                lab = page.locator(f"label:has({hook})")
-                if lab.count():
-                    lab.first.scroll_into_view_if_needed(timeout=4000)
-                    lab.first.click(timeout=5000)
-                else:
-                    box.first.check(timeout=5000, force=True)
-
-                # Wait for the list to actually redraw rather than a fixed
-                # pause, so a slow response cannot leave the previous term's
-                # products on screen to be parsed as this one's.
-                for _ in range(15):
-                    page.wait_for_timeout(400)
-                    now = _first_article(page)
-                    if now and now != before_click:
-                        break
-                page.wait_for_selector(FLAGSTONE_SAMPLE_READY, timeout=15000)
-            except Exception as e:
-                print(f"    flagstone {label}: filter failed, {type(e).__name__}",
-                      file=sys.stderr)
-                continue
-
-            got = parse_flagstone_sample(page.content(), view)
-            products += got
-            print(f"    flagstone {view} {label}: {len(got)}", file=sys.stderr)
+                got = parse_flagstone_sample(page.content(), view)
+                products += got
+                print(f"    flagstone {view} {label}: {len(got)} "
+                      f"(page says {_flagstone_results(page)})", file=sys.stderr)
 
         browser.close()
+
+    # Outside the Playwright context on purpose: fetch_flagstone_pages opens
+    # its own, and Playwright's sync API refuses to nest inside a live one.
+    if not filters_present or failed:
+        why = "filters absent" if not filters_present else f"failed: {', '.join(failed)}"
+        print(f"    flagstone {view}: {why}, adding paging pass", file=sys.stderr)
+        products += [q for h in fetch_flagstone_pages(url)
+                     for q in parse_flagstone_sample(h, view)]
 
     return products
 
@@ -814,7 +849,7 @@ def raisin_prep(page, amount, warn_on_single_page=True):
     """
     Set the amount, then exhaust the Load more button.
 
-    Raisin shows 10 products and hides the rest behind Load more. Sorting only
+    Raisin shows a first batch of cards and hides the rest behind Load more. Sorting only
     reorders those 10, which is why an earlier run returned five year bonds and
     nothing else. No sort is needed once every row is loaded, we rank ourselves.
     """
@@ -851,7 +886,7 @@ def raisin_prep(page, amount, warn_on_single_page=True):
     # only (id, termNormalized.months, interestRateEffective, and a minimum
     # balance it never prints in the HTML). Paging must therefore call an API.
     # Naming it here costs nothing and would let this source drop the browser
-    # entirely, the way Meteor and Flagstone already have.
+    # entirely, the way Meteor and Flagstone's ISA page already have.
     for u in sorted(seen_api)[:6]:
         print(f"    raisin api: {u[:120]}", file=sys.stderr)
     if warn_on_single_page and got <= 10:
@@ -1160,7 +1195,11 @@ def send_email(ranked, products):
         return
 
     thin = [label for key, label in BUCKETS if len(ranked[key]) < 10]
-    failed = [k for k, v in HEALTH.items() if isinstance(v, str) or v == 0]
+    # Only source rows count. The health block also carries descriptive
+    # strings and a count that is legitimately zero on a good day.
+    failed = [k for k, v in HEALTH.items()
+              if (isinstance(v, str) and v.startswith("FAILED"))
+              or (v == 0 and k != "shown, minimum not published")]
 
     body = [
         f"Savings rates for {date.today():%d %B %Y}, {DEPOSIT_LABEL}.",
