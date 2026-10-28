@@ -445,6 +445,110 @@ def parse_flagstone_sample(html: str, view: str = "") -> list[Product]:
     return out
 
 
+# Flagstone sorts by rate descending across every term at once, so instant
+# access products, which pay less than fixed term, sit at the bottom of a
+# 17-page list. However many pages the paging reached that morning decided how
+# many easy access products survived: 16 products one day, 10 easy access the
+# next, 2 the day after. Filtering by term instead makes each view small and
+# puts that term's best rates on page one, so a top ten needs no paging.
+#
+# The hooks are data-heap-id analytics attributes, not styled-components
+# hashes, so they survive a restyle the way the class names do not.
+FLAGSTONE_TERM_FILTERS = [
+    ("easy access", "Instant"),
+    ("6m", "M6"),
+    ("9m", "M7To9"),
+    ("12m", "M12"),
+    ("24m", "Y2"),
+    ("36m", "Y3"),
+    ("60m", "Y5Plus"),
+]
+
+
+def _first_article(page) -> str:
+    """Identity of the top card, used to tell a redraw from a stale view."""
+    try:
+        a = page.locator(FLAGSTONE_SAMPLE_READY).first
+        return a.inner_text(timeout=3000)[:120] if a.count() else ""
+    except Exception:
+        return ""
+
+
+def fetch_flagstone_filtered(url: str, view: str) -> list[Product]:
+    """
+    Read the sample portfolio once per term rather than paging the whole list.
+
+    The filter only decides which products are on screen; the bucket still
+    comes from each article's own text, so a filter that selects loosely (the
+    7-9 month one, say) costs nothing. Falls back to paging if the filter
+    controls cannot be found at all.
+    """
+    from playwright.sync_api import sync_playwright
+
+    products: list[Product] = []
+    with sync_playwright() as p:
+        browser = p.chromium.launch()
+        page = browser.new_page(**UK_CONTEXT, viewport={"width": 1400, "height": 1200})
+        page.goto(url, wait_until="domcontentloaded", timeout=45000)
+        dismiss_cookies(page)
+        page.wait_for_selector(FLAGSTONE_SAMPLE_READY, timeout=30000)
+
+        if page.locator('[data-heap-id^="term-length-filter"]').count() == 0:
+            print("    flagstone: term filters absent, paging instead", file=sys.stderr)
+            browser.close()
+            return [q for h in fetch_flagstone_pages(url)
+                    for q in parse_flagstone_sample(h, view)]
+
+        for label, fid in FLAGSTONE_TERM_FILTERS:
+            hook = f'[data-heap-id="term-length-filter-{fid}-checkbox"]'
+            try:
+                # Reset first: the filters are additive, so without this each
+                # term would be read on top of the last.
+                try:
+                    page.get_by_text("Clear all", exact=False).first.click(timeout=3000)
+                    page.wait_for_timeout(700)
+                except Exception:
+                    pass
+
+                before_click = _first_article(page)
+
+                box = page.locator(hook)
+                if box.count() == 0:
+                    print(f"    flagstone {label}: no {fid} filter", file=sys.stderr)
+                    continue
+
+                # The input is a styled checkbox, usually not clickable itself,
+                # so click the label that wraps it and fall back to the input.
+                lab = page.locator(f"label:has({hook})")
+                if lab.count():
+                    lab.first.scroll_into_view_if_needed(timeout=4000)
+                    lab.first.click(timeout=5000)
+                else:
+                    box.first.check(timeout=5000, force=True)
+
+                # Wait for the list to actually redraw rather than a fixed
+                # pause, so a slow response cannot leave the previous term's
+                # products on screen to be parsed as this one's.
+                for _ in range(15):
+                    page.wait_for_timeout(400)
+                    now = _first_article(page)
+                    if now and now != before_click:
+                        break
+                page.wait_for_selector(FLAGSTONE_SAMPLE_READY, timeout=15000)
+            except Exception as e:
+                print(f"    flagstone {label}: filter failed, {type(e).__name__}",
+                      file=sys.stderr)
+                continue
+
+            got = parse_flagstone_sample(page.content(), view)
+            products += got
+            print(f"    flagstone {view} {label}: {len(got)}", file=sys.stderr)
+
+        browser.close()
+
+    return products
+
+
 FLAGSTONE_MAX_PAGES = 25    # safety stop only. The real end is the last page button.
 
 
@@ -829,12 +933,8 @@ def collect() -> list[Product]:
         )
 
     for acct, url in FLAGSTONE_SAMPLE_TYPES.items():
-        attempt(
-            f"Flagstone {acct}",
-            lambda u=url, a=acct: [
-                p for h in fetch_flagstone_pages(u) for p in parse_flagstone_sample(h, a)
-            ],
-        )
+        attempt(f"Flagstone {acct}",
+                lambda u=url, a=acct: fetch_flagstone_filtered(u, a))
 
     for kind, (url, isa) in FLAGSTONE.items():
         attempt(
