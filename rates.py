@@ -482,6 +482,29 @@ def _flagstone_results(page) -> str:
         return "?"
 
 
+def _wait_for_redraw(page, before_card: str, before_count: str,
+                     seconds: float = 15) -> bool:
+    """
+    Wait until the list has genuinely redrawn with real products.
+
+    Two conditions, both needed. Changed: the top card or the site's own result
+    count differs from before the click; the count catches the case where a
+    filtered view happens to share the old top card. Rendered: the top card
+    carries a rate, so a loading placeholder cannot pass for the new view.
+    A datacentre runner can take several seconds to get a response, and
+    accepting the first change of any kind is the likeliest reason views were
+    being captured empty.
+    """
+    for _ in range(int(seconds / 0.4)):
+        page.wait_for_timeout(400)
+        card = _first_article(page)
+        count = _flagstone_results(page)
+        changed = (card and card != before_card) or (count != "?" and count != before_count)
+        if changed and "%" in card:
+            return True
+    return False
+
+
 def _expand_terms(page):
     """
     Open the collapsed block of less common terms if it is closed.
@@ -526,6 +549,10 @@ def fetch_flagstone_filtered(url: str, view: str) -> list[Product]:
         dismiss_cookies(page)
         page.wait_for_selector(FLAGSTONE_SAMPLE_READY, timeout=30000)
 
+        save_debug(f"flagstone-{view}-0-onload", page.content())
+        print(f"    flagstone {view} on load: page says {_flagstone_results(page)}; "
+              f"top card {_first_article(page)[:40]!r}", file=sys.stderr)
+
         if page.locator('[data-heap-id^="term-length-filter"]').count() == 0:
             filters_present = False
         else:
@@ -536,9 +563,15 @@ def fetch_flagstone_filtered(url: str, view: str) -> list[Product]:
                     # disabled when nothing is ticked, so skip it then rather
                     # than wait out a click timeout.
                     clear = page.get_by_role("button", name="Clear all", exact=True)
-                    if clear.count() and clear.first.is_enabled():
+                    c_state = ("absent" if not clear.count() else
+                               "enabled" if clear.first.is_enabled() else "disabled")
+                    if c_state == "enabled":
+                        pre = (_first_article(page), _flagstone_results(page))
                         clear.first.click(timeout=3000)
-                        page.wait_for_timeout(700)
+                        # Let the reset land before the next click. Otherwise
+                        # its response can arrive after the new filter's and
+                        # overwrite it with the unfiltered list.
+                        _wait_for_redraw(page, *pre)
 
                     if page.locator(hook).count() == 0:
                         print(f"    flagstone {label}: no {fid} filter", file=sys.stderr)
@@ -546,30 +579,44 @@ def fetch_flagstone_filtered(url: str, view: str) -> list[Product]:
                         continue
 
                     _expand_terms(page)
-                    before_click = _first_article(page)
+                    more = page.get_by_role("button", name="Show more", exact=True)
+                    print(f"    flagstone {view} {label}: clear-all {c_state}, "
+                          f"show-more {'still collapsed' if more.count() else 'open'}",
+                          file=sys.stderr)
+                    pre = (_first_article(page), _flagstone_results(page))
                     lab = page.locator(f"label:has({hook})").first
                     lab.scroll_into_view_if_needed(timeout=4000)
                     lab.click(timeout=5000)
-
-                    # Wait for the list to actually redraw rather than a fixed
-                    # pause, so a slow response cannot leave the previous
-                    # term's products on screen to be parsed as this one's.
-                    for _ in range(15):
-                        page.wait_for_timeout(400)
-                        now = _first_article(page)
-                        if now and now != before_click:
-                            break
-                    page.wait_for_selector(FLAGSTONE_SAMPLE_READY, timeout=15000)
+                    redrew = _wait_for_redraw(page, *pre)
                 except Exception as e:
                     print(f"    flagstone {label}: filter failed, {type(e).__name__}",
                           file=sys.stderr)
                     failed.append(label)
                     continue
 
-                got = parse_flagstone_sample(page.content(), view)
+                html = page.content()
+                got = parse_flagstone_sample(html, view)
                 products += got
+
+                # Diagnostic: which boxes the page now has ticked, what the
+                # first card is, and a copy of the view as the runner saw it.
+                ticked = []
+                for _, f2 in FLAGSTONE_TERM_FILTERS:
+                    try:
+                        cb = page.locator(f'[data-heap-id="term-length-filter-{f2}-checkbox"]').first
+                        if cb.is_checked():
+                            ticked.append(f2)
+                    except Exception:
+                        pass
+                buckets = sorted({q.bucket for q in got})
                 print(f"    flagstone {view} {label}: {len(got)} "
-                      f"(page says {_flagstone_results(page)})", file=sys.stderr)
+                      f"({'redrew' if redrew else 'NO REDRAW in 15s'}; "
+                      f"page says {_flagstone_results(page)}; ticked {ticked or 'none'}; "
+                      f"buckets {buckets or 'none'}; top card "
+                      f"{_first_article(page)[:40]!r})", file=sys.stderr)
+                save_debug(f"flagstone-{view}-{fid}", html)
+                if not redrew:
+                    failed.append(label)
 
         browser.close()
 
